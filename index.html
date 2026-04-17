@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>TwinMind — Live Suggestions Assignment Mockup</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --panel-2: #1d212a;
+    --border: #272c38;
+    --text: #e7e9ee;
+    --muted: #8a93a6;
+    --accent: #6ea8fe;
+    --accent-2: #b388ff;
+    --good: #4ade80;
+    --warn: #fbbf24;
+    --danger: #ef4444;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; height: 100%; background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  .topbar {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 10px 16px; border-bottom: 1px solid var(--border); background: var(--panel);
+  }
+  .topbar h1 { font-size: 14px; font-weight: 600; margin: 0; letter-spacing: .3px; }
+  .topbar .meta { font-size: 12px; color: var(--muted); }
+  .layout {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 12px;
+    padding: 12px;
+    height: calc(100vh - 46px);
+  }
+  .col {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    display: flex; flex-direction: column;
+    overflow: hidden;
+    min-height: 0;
+  }
+  .col header {
+    padding: 10px 14px; border-bottom: 1px solid var(--border);
+    font-size: 12px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted);
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .col .body { flex: 1; overflow-y: auto; padding: 14px; }
+
+  /* LEFT: mic + transcript */
+  .mic-wrap { display: flex; align-items: center; gap: 10px; padding: 14px; border-bottom: 1px solid var(--border); }
+  .mic-btn {
+    width: 44px; height: 44px; border-radius: 50%;
+    border: none; cursor: pointer;
+    background: var(--accent); color: #000; font-size: 18px;
+    display: flex; align-items: center; justify-content: center;
+    transition: background .2s;
+  }
+  .mic-btn.recording { background: var(--danger); color: #fff; animation: pulse 1.4s infinite; }
+  @keyframes pulse { 0%,100%{box-shadow:0 0 0 0 rgba(239,68,68,.5);} 50%{box-shadow:0 0 0 10px rgba(239,68,68,0);} }
+  .mic-status { font-size: 13px; color: var(--muted); }
+  .transcript-line { font-size: 14px; line-height: 1.55; margin-bottom: 10px; color: #cfd3dc; }
+  .transcript-line .ts { color: var(--muted); font-size: 11px; margin-right: 6px; }
+  .transcript-line.new { animation: fadein .4s ease-out; }
+  @keyframes fadein { from{opacity:0; transform: translateY(4px);} to{opacity:1; transform:none;} }
+
+  /* MIDDLE: suggestions */
+  .reload-row { padding: 10px 14px; border-bottom: 1px solid var(--border); display: flex; gap: 8px; align-items: center; }
+  .reload-btn {
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+    padding: 6px 12px; border-radius: 6px; font-size: 12px; cursor: pointer;
+  }
+  .reload-btn:hover { border-color: var(--accent); }
+  .countdown { font-size: 11px; color: var(--muted); margin-left: auto; }
+  .suggestion {
+    border: 1px solid var(--border); background: var(--panel-2);
+    border-radius: 8px; padding: 12px; margin-bottom: 10px; cursor: pointer;
+    transition: border-color .15s, transform .15s;
+  }
+  .suggestion:hover { border-color: var(--accent); transform: translateY(-1px); }
+  .suggestion.fresh { border-color: var(--accent); }
+  .suggestion.stale { opacity: .55; }
+  .sug-tag {
+    display: inline-block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px;
+    padding: 2px 6px; border-radius: 4px; margin-bottom: 6px;
+  }
+  .sug-tag.question { background: rgba(110,168,254,.15); color: var(--accent); }
+  .sug-tag.talking  { background: rgba(179,136,255,.15); color: var(--accent-2); }
+  .sug-tag.answer   { background: rgba(74,222,128,.15);  color: var(--good); }
+  .sug-tag.fact     { background: rgba(251,191,36,.15);  color: var(--warn); }
+  .sug-title { font-size: 14px; font-weight: 500; line-height: 1.4; }
+  .sug-batch-divider { font-size: 10px; color: var(--muted); text-align: center; padding: 6px 0; text-transform: uppercase; letter-spacing: 1px; }
+
+  /* RIGHT: chat */
+  .chat-msg { margin-bottom: 14px; }
+  .chat-msg .who { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 4px; }
+  .chat-msg .bubble { background: var(--panel-2); border: 1px solid var(--border); padding: 10px 12px; border-radius: 8px; font-size: 13px; line-height: 1.5; }
+  .chat-msg.user .bubble { background: rgba(110,168,254,.08); border-color: rgba(110,168,254,.3); }
+  .chat-input-row { padding: 10px; border-top: 1px solid var(--border); display: flex; gap: 8px; }
+  .chat-input-row input { flex: 1; background: var(--panel-2); border: 1px solid var(--border); color: var(--text); padding: 8px 10px; border-radius: 6px; font-size: 13px; }
+  .chat-input-row button { background: var(--accent); color: #000; border: none; padding: 8px 14px; border-radius: 6px; cursor: pointer; font-size: 13px; font-weight: 500; }
+
+  .empty { color: var(--muted); font-size: 13px; text-align: center; padding: 30px 10px; line-height: 1.5; }
+  .help-banner {
+    background: rgba(110,168,254,.08); border: 1px solid rgba(110,168,254,.3);
+    color: #cfd3dc; padding: 8px 12px; font-size: 12px; border-radius: 6px;
+    margin: 12px; line-height: 1.5;
+  }
+  .col .body::-webkit-scrollbar { width: 6px; }
+  .col .body::-webkit-scrollbar-thumb { background: #2a2f3a; border-radius: 3px; }
+</style>
+</head>
+<body>
+  <div class="topbar">
+    <h1>TwinMind — Live Suggestions Web App (Reference Mockup)</h1>
+    <div class="meta">3-column layout · Transcript · Live Suggestions · Chat</div>
+  </div>
+
+  <div class="layout">
+    <!-- LEFT COLUMN: MIC + TRANSCRIPT -->
+    <div class="col">
+      <header><span>1. Mic & Transcript</span><span id="recState">idle</span></header>
+      <div class="mic-wrap">
+        <button id="micBtn" class="mic-btn" title="Start / stop recording">●</button>
+        <div class="mic-status" id="micStatus">Click mic to start. Transcript appends every ~30s.</div>
+      </div>
+      <div class="body" id="transcriptBody">
+        <div class="help-banner">
+          The transcript scrolls and appends new chunks every ~30 seconds while recording.
+          Use the mic button to start/stop. Include an export button (not shown) so we can pull the full session.
+        </div>
+        <div class="empty" id="transcriptEmpty">No transcript yet — start the mic.</div>
+      </div>
+    </div>
+
+    <!-- MIDDLE COLUMN: LIVE SUGGESTIONS -->
+    <div class="col">
+      <header><span>2. Live Suggestions</span><span id="batchCount">0 batches</span></header>
+      <div class="reload-row">
+        <button class="reload-btn" id="reloadBtn">↻ Reload suggestions</button>
+        <span class="countdown" id="countdown">auto-refresh in 30s</span>
+      </div>
+      <div class="body" id="suggestionsBody">
+        <div class="help-banner">
+          On reload (or auto every ~30s), generate <b>3 fresh suggestions</b> from recent transcript context.
+          New batch appears at the top; older batches push down (faded). Each is a tappable card: a
+          <span style="color:var(--accent)">question to ask</span>,
+          a <span style="color:var(--accent-2)">talking point</span>,
+          an <span style="color:var(--good)">answer</span>, or a
+          <span style="color:var(--warn)">fact-check</span>.
+          The preview alone should already be useful.
+        </div>
+        <div class="empty" id="suggestionsEmpty">Suggestions appear here once recording starts.</div>
+      </div>
+    </div>
+
+    <!-- RIGHT COLUMN: CHAT -->
+    <div class="col">
+      <header><span>3. Chat (detailed answers)</span><span>session-only</span></header>
+      <div class="body" id="chatBody">
+        <div class="help-banner">
+          Clicking a suggestion adds it to this chat and streams a detailed answer (separate prompt, more context).
+          User can also type questions directly. One continuous chat per session — no login, no persistence.
+        </div>
+        <div class="empty" id="chatEmpty">Click a suggestion or type a question below.</div>
+      </div>
+      <div class="chat-input-row">
+        <input id="chatInput" placeholder="Ask anything…" />
+        <button id="chatSend">Send</button>
+      </div>
+    </div>
+  </div>
+
+<script>
+  // ---------- Simulated demo data ----------
+  const transcriptChunks = [
+    "So we're talking about how to scale our backend to handle a million concurrent users.",
+    "The main bottleneck right now is the websocket connections and how we're handling state in memory.",
+    "I read that companies like Discord shard by guild ID — should we do something similar by user cohort?",
+    "Also concerned about cost. If we move to managed Kafka, what's a realistic monthly bill at our volume?",
+    "And one more thing — what was the failure mode when Slack went down last year? I want to avoid that pattern."
+  ];
+
+  const suggestionBatches = [
+    [
+      { type: "question", text: "What's your current p99 latency on websocket round-trips?" },
+      { type: "talking",  text: "Discord's sharding model: 2,500 guilds per shard, ~150k concurrent users each." },
+      { type: "fact",     text: "Fact-check: Slack's 2024 outage was a config push, not capacity — different problem." }
+    ],
+    [
+      { type: "answer",   text: "Managed Kafka (MSK) at ~1M events/sec runs roughly $8-15k/mo on AWS." },
+      { type: "question", text: "Have you considered NATS JetStream as a lighter-weight alternative?" },
+      { type: "talking",  text: "Sharding by user cohort works if cohorts are stable; bad for viral spikes." }
+    ],
+    [
+      { type: "answer",   text: "For state-in-memory issues: Redis Cluster + consistent hashing handles ~1M ops/sec/node." },
+      { type: "fact",     text: "Discord publicly serves ~15M concurrent voice users on Elixir/Erlang infra." },
+      { type: "question", text: "What's your read/write ratio? That changes the sharding strategy significantly." }
+    ]
+  ];
+
+  // ---------- State ----------
+  let recording = false;
+  let transcriptIdx = 0;
+  let batchIdx = 0;
+  let countdown = 30;
+  let recordingTimer = null;
+  let countdownTimer = null;
+
+  const $ = id => document.getElementById(id);
+
+  // ---------- Mic ----------
+  $("micBtn").addEventListener("click", () => {
+    recording = !recording;
+    $("micBtn").classList.toggle("recording", recording);
+    $("recState").textContent = recording ? "● recording" : "idle";
+    $("micStatus").textContent = recording ? "Listening… transcript updates every 30s." : "Stopped. Click to resume.";
+    if (recording) {
+      addTranscriptChunk();
+      recordingTimer = setInterval(addTranscriptChunk, 6000); // sped-up demo
+      countdownTimer = setInterval(tickCountdown, 1000);
+    } else {
+      clearInterval(recordingTimer);
+      clearInterval(countdownTimer);
+    }
+  });
+
+  function addTranscriptChunk() {
+    const empty = $("transcriptEmpty");
+    if (empty) empty.remove();
+    const chunk = transcriptChunks[transcriptIdx % transcriptChunks.length];
+    transcriptIdx++;
+    const now = new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'});
+    const div = document.createElement("div");
+    div.className = "transcript-line new";
+    div.innerHTML = `<span class="ts">${now}</span>${chunk}`;
+    $("transcriptBody").appendChild(div);
+    $("transcriptBody").scrollTop = $("transcriptBody").scrollHeight;
+    // also auto-add a suggestions batch in demo
+    if (transcriptIdx % 2 === 0) addSuggestionBatch();
+  }
+
+  // ---------- Suggestions ----------
+  $("reloadBtn").addEventListener("click", () => {
+    addSuggestionBatch();
+    countdown = 30;
+  });
+
+  function addSuggestionBatch() {
+    const empty = $("suggestionsEmpty");
+    if (empty) empty.remove();
+    // mark prior fresh as stale
+    document.querySelectorAll(".suggestion.fresh").forEach(el => {
+      el.classList.remove("fresh");
+      el.classList.add("stale");
+    });
+    const batch = suggestionBatches[batchIdx % suggestionBatches.length];
+    batchIdx++;
+    const wrap = document.createElement("div");
+    const divider = document.createElement("div");
+    divider.className = "sug-batch-divider";
+    divider.textContent = `— Batch ${batchIdx} · ${new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'})} —`;
+    // newest at top: insert wrap before existing children (after banner)
+    const body = $("suggestionsBody");
+    const insertAfter = body.querySelector(".help-banner");
+    const fragment = document.createDocumentFragment();
+    batch.forEach(s => {
+      const card = document.createElement("div");
+      card.className = "suggestion fresh";
+      card.innerHTML = `<span class="sug-tag ${s.type}">${labelFor(s.type)}</span><div class="sug-title">${s.text}</div>`;
+      card.addEventListener("click", () => sendToChat(s.text, s.type));
+      fragment.appendChild(card);
+    });
+    fragment.appendChild(divider);
+    insertAfter.after(fragment);
+    $("batchCount").textContent = `${batchIdx} batch${batchIdx===1?'':'es'}`;
+  }
+
+  function labelFor(t) {
+    return { question: "Question to ask", talking: "Talking point", answer: "Answer", fact: "Fact-check" }[t];
+  }
+
+  function tickCountdown() {
+    countdown--;
+    if (countdown <= 0) {
+      addSuggestionBatch();
+      countdown = 30;
+    }
+    $("countdown").textContent = `auto-refresh in ${countdown}s`;
+  }
+
+  // ---------- Chat ----------
+  function sendToChat(text, type) {
+    addChatMsg("user", text, type ? labelFor(type) : null);
+    setTimeout(() => addChatMsg("ai", simulateAnswer(text)), 600);
+  }
+
+  function addChatMsg(who, text, label) {
+    const empty = $("chatEmpty");
+    if (empty) empty.remove();
+    const div = document.createElement("div");
+    div.className = `chat-msg ${who}`;
+    div.innerHTML = `<div class="who">${who === "user" ? (label ? "You · " + label : "You") : "Assistant"}</div><div class="bubble">${text}</div>`;
+    $("chatBody").appendChild(div);
+    $("chatBody").scrollTop = $("chatBody").scrollHeight;
+  }
+
+  function simulateAnswer(q) {
+    return `Detailed answer to: "${q}"<br><br>This is where a separate, longer-form prompt runs against the chat model with full transcript context. Streamed response ideally. Candidates choose model + prompt strategy — we evaluate quality, latency, relevance.`;
+  }
+
+  $("chatSend").addEventListener("click", () => {
+    const v = $("chatInput").value.trim();
+    if (!v) return;
+    sendToChat(v);
+    $("chatInput").value = "";
+  });
+  $("chatInput").addEventListener("keydown", e => { if (e.key === "Enter") $("chatSend").click(); });
+</script>
+</body>
+</html>
