@@ -4,13 +4,46 @@ export const runtime = "nodejs";
 
 const GROQ_TRANSCRIPTION_URL = "https://api.groq.com/openai/v1/audio/transcriptions";
 const DEFAULT_TRANSCRIPTION_MODEL = "whisper-large-v3";
+const DEFAULT_TRANSCRIPTION_LANGUAGE = "en";
 
 type GroqTranscriptionResponse = {
   text?: string;
+  segments?: Array<{
+    avg_logprob?: number;
+    compression_ratio?: number;
+    no_speech_prob?: number;
+    text?: string;
+  }>;
   error?: {
     message?: string;
   };
 };
+
+function getQualityMetrics(transcription: GroqTranscriptionResponse) {
+  const segments = transcription.segments ?? [];
+  const numericSegments = segments.filter((segment) => typeof segment.no_speech_prob === "number");
+  const noSpeechProbability =
+    numericSegments.length > 0
+      ? Math.max(...numericSegments.map((segment) => segment.no_speech_prob ?? 0))
+      : null;
+  const avgLogprobValues = segments
+    .map((segment) => segment.avg_logprob)
+    .filter((value): value is number => typeof value === "number");
+  const compressionRatioValues = segments
+    .map((segment) => segment.compression_ratio)
+    .filter((value): value is number => typeof value === "number");
+
+  return {
+    segmentCount: segments.length,
+    noSpeechProbability,
+    avgLogprob:
+      avgLogprobValues.length > 0
+        ? avgLogprobValues.reduce((sum, value) => sum + value, 0) / avgLogprobValues.length
+        : null,
+    maxCompressionRatio:
+      compressionRatioValues.length > 0 ? Math.max(...compressionRatioValues) : null,
+  };
+}
 
 function jsonError(message: string, status: number) {
   return Response.json({ error: message }, { status });
@@ -96,13 +129,15 @@ export async function POST(request: Request) {
   const groqForm = new FormData();
   groqForm.append("file", audio, audio.name || "meeting-chunk.webm");
   groqForm.append("model", requestedModel);
-  groqForm.append("response_format", "json");
+  groqForm.append("language", DEFAULT_TRANSCRIPTION_LANGUAGE);
+  groqForm.append("response_format", "verbose_json");
   groqForm.append("temperature", "0");
 
   await writeLog("groq", {
     event: "groq_transcription_request_started",
     requestedAt: requestedAt.toISOString(),
     model: requestedModel,
+    language: DEFAULT_TRANSCRIPTION_LANGUAGE,
     audio: audioLog,
   });
 
@@ -127,6 +162,7 @@ export async function POST(request: Request) {
       completedAt: completedAt.toISOString(),
       durationMs,
       model: requestedModel,
+      language: DEFAULT_TRANSCRIPTION_LANGUAGE,
       status: groqResponse.status,
       audio: audioLog,
     });
@@ -137,6 +173,7 @@ export async function POST(request: Request) {
       completedAt: completedAt.toISOString(),
       durationMs,
       model: requestedModel,
+      language: DEFAULT_TRANSCRIPTION_LANGUAGE,
       status: groqResponse.status,
       audio: audioLog,
       error,
@@ -147,6 +184,7 @@ export async function POST(request: Request) {
 
   const transcription = JSON.parse(responseBody) as GroqTranscriptionResponse;
   const text = transcription.text?.trim() ?? "";
+  const quality = getQualityMetrics(transcription);
 
   await writeLog("groq", {
     event: "groq_transcription_request_completed",
@@ -154,9 +192,11 @@ export async function POST(request: Request) {
     completedAt: completedAt.toISOString(),
     durationMs,
     model: requestedModel,
+    language: DEFAULT_TRANSCRIPTION_LANGUAGE,
     status: groqResponse.status,
     audio: audioLog,
     textLength: text.length,
+    quality,
   });
 
   await writeLog("transcription", {
@@ -165,11 +205,13 @@ export async function POST(request: Request) {
     completedAt: completedAt.toISOString(),
     durationMs,
     model: requestedModel,
+    language: DEFAULT_TRANSCRIPTION_LANGUAGE,
     status: groqResponse.status,
     audio: audioLog,
     textLength: text.length,
     text,
+    quality,
   });
 
-  return Response.json({ text });
+  return Response.json({ text, quality });
 }

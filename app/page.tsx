@@ -15,6 +15,14 @@ const AUDIO_ACTIVITY_SAMPLE_MS = 200;
 const MIN_SPEECH_RMS = 0.012;
 const MIN_SPEECH_SAMPLES = 2;
 const DUPLICATE_SIMILARITY_THRESHOLD = 0.86;
+const WEAK_AUDIO_RMS = 0.03;
+const WEAK_SPEECH_SAMPLE_RATIO = 0.18;
+const HIGH_NO_SPEECH_PROBABILITY = 0.55;
+const LOW_AVG_LOGPROB = -1.15;
+const VERY_LOW_AVG_LOGPROB = -2;
+const LOW_CONFIDENCE_FRAGMENT_AVG_LOGPROB = -0.85;
+const LOW_CONFIDENCE_FRAGMENT_COMPRESSION_RATIO = 0.35;
+const WEAK_ARTIFACT_NO_SPEECH_PROBABILITY = 0.15;
 
 const suggestionBatches = [
   [
@@ -64,6 +72,28 @@ type ChatMessage = {
 type TranscriptionResponse = {
   text?: string;
   error?: string;
+  quality?: TranscriptionQuality;
+};
+
+type TranscriptionQuality = {
+  segmentCount?: number;
+  noSpeechProbability?: number | null;
+  avgLogprob?: number | null;
+  maxCompressionRatio?: number | null;
+};
+
+type AudioChunkStats = {
+  audioType: string;
+  audioSize: number;
+  durationMs: number;
+  speechSamples: number;
+  totalSamples: number;
+  maxRms: number;
+};
+
+type TranscriptFilterContext = {
+  audioStats?: AudioChunkStats;
+  quality?: TranscriptionQuality;
 };
 
 type StoredSettings = {
@@ -238,6 +268,21 @@ function isLikelyWhisperOutroArtifact(text: string) {
   return /^(thank you|thank you for watching|you for watching|thanks for watching|thanks)$/.test(normalized);
 }
 
+function isLikelySubtitleArtifact(text: string) {
+  const normalized = normalizeTranscriptText(text);
+  return (
+    /subtitles?/.test(normalized) ||
+    /dimatorzok/.test(normalized) ||
+    /[\u0400-\u04ff]/.test(text)
+  );
+}
+
+function isLikelyNonEnglishShortArtifact(text: string) {
+  const normalized = normalizeTranscriptText(text);
+  const words = normalized.split(" ").filter(Boolean);
+  return words.length > 0 && words.length <= 4 && /[^\u0000-\u007f]/.test(text);
+}
+
 function isLowInformationFragment(text: string) {
   const words = normalizeTranscriptText(text).split(" ").filter(Boolean);
 
@@ -252,14 +297,91 @@ function isLowInformationFragment(text: string) {
   return words.length <= 2 && words.join("").length <= 14;
 }
 
-function shouldSkipTranscriptText(text: string, recentLines: TranscriptLine[]) {
-  const normalized = normalizeTranscriptText(text);
-
-  if (!normalized || isLikelyWhisperOutroArtifact(text) || isLowInformationFragment(text)) {
-    return true;
+function getSpeechSampleRatio(audioStats?: AudioChunkStats) {
+  if (!audioStats || audioStats.totalSamples <= 0) {
+    return null;
   }
 
-  return recentLines.slice(-4).some((line) => {
+  return audioStats.speechSamples / audioStats.totalSamples;
+}
+
+function hasVeryLowConfidence(context?: TranscriptFilterContext) {
+  return Boolean(
+    typeof context?.quality?.avgLogprob === "number" &&
+      context.quality.avgLogprob <= VERY_LOW_AVG_LOGPROB,
+  );
+}
+
+function hasWeakArtifactSignal(context?: TranscriptFilterContext) {
+  const audioStats = context?.audioStats;
+  const quality = context?.quality;
+  const speechRatio = getSpeechSampleRatio(audioStats);
+
+  return Boolean(
+    hasWeakTranscriptSignal(context) ||
+      (audioStats &&
+        speechRatio !== null &&
+        speechRatio < WEAK_SPEECH_SAMPLE_RATIO &&
+        typeof quality?.noSpeechProbability === "number" &&
+        quality.noSpeechProbability >= WEAK_ARTIFACT_NO_SPEECH_PROBABILITY),
+  );
+}
+
+function hasLowConfidenceFragmentSignal(context?: TranscriptFilterContext) {
+  const quality = context?.quality;
+
+  return Boolean(
+    hasWeakTranscriptSignal(context) ||
+      (typeof quality?.avgLogprob === "number" &&
+        quality.avgLogprob <= LOW_CONFIDENCE_FRAGMENT_AVG_LOGPROB &&
+        typeof quality?.maxCompressionRatio === "number" &&
+        quality.maxCompressionRatio <= LOW_CONFIDENCE_FRAGMENT_COMPRESSION_RATIO),
+  );
+}
+
+function hasWeakTranscriptSignal(context?: TranscriptFilterContext) {
+  const audioStats = context?.audioStats;
+  const quality = context?.quality;
+  const speechRatio = getSpeechSampleRatio(audioStats);
+
+  return Boolean(
+    (typeof quality?.noSpeechProbability === "number" &&
+      quality.noSpeechProbability >= HIGH_NO_SPEECH_PROBABILITY) ||
+      (typeof quality?.avgLogprob === "number" && quality.avgLogprob <= LOW_AVG_LOGPROB) ||
+      (audioStats &&
+        audioStats.maxRms < WEAK_AUDIO_RMS &&
+        (speechRatio === null || speechRatio < WEAK_SPEECH_SAMPLE_RATIO)),
+  );
+}
+
+function getTranscriptFilterReason(text: string, recentLines: TranscriptLine[], context?: TranscriptFilterContext) {
+  const normalized = normalizeTranscriptText(text);
+
+  if (!normalized) {
+    return "empty";
+  }
+
+  if (hasVeryLowConfidence(context)) {
+    return "very_low_confidence";
+  }
+
+  if (isLikelySubtitleArtifact(text) && hasWeakArtifactSignal(context)) {
+    return "subtitle_artifact_weak_signal";
+  }
+
+  if (isLikelyNonEnglishShortArtifact(text) && hasWeakArtifactSignal(context)) {
+    return "non_english_short_artifact_weak_signal";
+  }
+
+  if (isLikelyWhisperOutroArtifact(text) && hasWeakArtifactSignal(context)) {
+    return "outro_artifact_weak_signal";
+  }
+
+  if (isLowInformationFragment(text) && hasLowConfidenceFragmentSignal(context)) {
+    return "low_information_weak_signal";
+  }
+
+  const duplicate = recentLines.slice(-4).some((line) => {
     const previous = normalizeTranscriptText(line.text);
 
     if (!previous) {
@@ -273,6 +395,12 @@ function shouldSkipTranscriptText(text: string, recentLines: TranscriptLine[]) {
       textSimilarity(line.text, text) >= DUPLICATE_SIMILARITY_THRESHOLD
     );
   });
+
+  return duplicate ? "duplicate" : null;
+}
+
+function shouldSkipTranscriptText(text: string, recentLines: TranscriptLine[], context?: TranscriptFilterContext) {
+  return getTranscriptFilterReason(text, recentLines, context) !== null;
 }
 
 export default function Home() {
@@ -444,44 +572,53 @@ export default function Home() {
     mediaStreamRef.current = null;
   }, []);
 
-  const appendTranscriptLine = useCallback((text: string, startedAt: Date, endedAt: Date) => {
-    const currentLines = transcriptLinesRef.current;
+  const appendTranscriptLine = useCallback(
+    (text: string, startedAt: Date, endedAt: Date, context?: TranscriptFilterContext) => {
+      const currentLines = transcriptLinesRef.current;
+      const filterReason = getTranscriptFilterReason(text, currentLines, context);
 
-    if (shouldSkipTranscriptText(text, currentLines)) {
-      emitClientLog("transcription", "transcript_text_filtered", {
+      if (filterReason) {
+        emitClientLog("transcription", "transcript_text_filtered", {
+          reason: filterReason,
+          text,
+          textLength: text.length,
+          recentLineCount: currentLines.length,
+          audioStats: context?.audioStats,
+          quality: context?.quality,
+        });
+        return;
+      }
+
+      transcriptIdRef.current += 1;
+      const id = transcriptIdRef.current;
+      const line = {
+        id,
+        time: timestamp(endedAt),
         text,
-        textLength: text.length,
-        recentLineCount: currentLines.length,
+        startedAt: startedAt.toISOString(),
+        endedAt: endedAt.toISOString(),
+      };
+
+      setTranscriptLines((current) => {
+        const nextLines = [...current, line];
+        transcriptLinesRef.current = nextLines;
+        return nextLines;
       });
-      return;
-    }
 
-    transcriptIdRef.current += 1;
-    const id = transcriptIdRef.current;
-    const line = {
-      id,
-      time: timestamp(endedAt),
-      text,
-      startedAt: startedAt.toISOString(),
-      endedAt: endedAt.toISOString(),
-    };
-
-    setTranscriptLines((current) => {
-      const nextLines = [...current, line];
-      transcriptLinesRef.current = nextLines;
-      return nextLines;
-    });
-
-    emitClientLog("transcription", "transcript_text_appended", {
-      id,
-      textLength: text.length,
-      startedAt: line.startedAt,
-      endedAt: line.endedAt,
-    });
-  }, []);
+      emitClientLog("transcription", "transcript_text_appended", {
+        id,
+        textLength: text.length,
+        startedAt: line.startedAt,
+        endedAt: line.endedAt,
+        audioStats: context?.audioStats,
+        quality: context?.quality,
+      });
+    },
+    [],
+  );
 
   const transcribeAudioChunk = useCallback(
-    async (blob: Blob, startedAt: Date, endedAt: Date) => {
+    async (blob: Blob, startedAt: Date, endedAt: Date, audioStats?: AudioChunkStats) => {
       const apiKey = groqApiKeyRef.current;
 
       if (!apiKey) {
@@ -509,6 +646,7 @@ export default function Home() {
           audioSize: blob.size,
           startedAt: startedAt.toISOString(),
           endedAt: endedAt.toISOString(),
+          audioStats,
         });
 
         const response = await fetch("/api/transcribe", {
@@ -530,10 +668,15 @@ export default function Home() {
           status: response.status,
           textLength: text?.length ?? 0,
           audioSize: blob.size,
+          quality: payload?.quality,
+          audioStats,
         });
 
         if (text) {
-          appendTranscriptLine(text, startedAt, endedAt);
+          appendTranscriptLine(text, startedAt, endedAt, {
+            audioStats,
+            quality: payload?.quality,
+          });
         }
       } catch (error) {
         setTranscriptionError(transcriptionErrorMessage(error));
@@ -542,6 +685,7 @@ export default function Home() {
           audioSize: blob.size,
           startedAt: startedAt.toISOString(),
           endedAt: endedAt.toISOString(),
+          audioStats,
         });
       } finally {
         setPendingTranscriptions((current) => Math.max(0, current - 1));
@@ -551,17 +695,18 @@ export default function Home() {
   );
 
   const enqueueTranscription = useCallback(
-    (blob: Blob, startedAt: Date, endedAt: Date) => {
+    (blob: Blob, startedAt: Date, endedAt: Date, audioStats?: AudioChunkStats) => {
       emitClientLog("audio", "audio_chunk_enqueued", {
         audioType: blob.type || "unknown",
         audioSize: blob.size,
         startedAt: startedAt.toISOString(),
         endedAt: endedAt.toISOString(),
+        audioStats,
       });
 
       transcriptionQueueRef.current = transcriptionQueueRef.current
         .catch(() => undefined)
-        .then(() => transcribeAudioChunk(blob, startedAt, endedAt));
+        .then(() => transcribeAudioChunk(blob, startedAt, endedAt, audioStats));
     },
     [transcribeAudioChunk],
   );
@@ -604,7 +749,7 @@ export default function Home() {
         const recordedMimeType = recorder.mimeType || mimeType || audioParts[0]?.type || "audio/webm";
         const audioBlob = new Blob(audioParts, { type: recordedMimeType });
         const hasSpeech = hasSegmentSpeechActivity();
-        const audioStats = {
+        const audioStats: AudioChunkStats = {
           audioType: recordedMimeType,
           audioSize: audioBlob.size,
           durationMs,
@@ -615,7 +760,7 @@ export default function Home() {
 
         if (audioBlob.size >= MIN_AUDIO_CHUNK_BYTES && durationMs >= MIN_AUDIO_CHUNK_MS && hasSpeech) {
           emitClientLog("audio", "audio_chunk_ready", audioStats);
-          enqueueTranscription(audioBlob, startedAt, endedAt);
+          enqueueTranscription(audioBlob, startedAt, endedAt, audioStats);
         } else {
           emitClientLog("audio", "audio_chunk_skipped", {
             ...audioStats,
@@ -889,7 +1034,7 @@ export default function Home() {
       return "Stopped. Click to resume.";
     }
 
-    return "Click mic to start. Transcript appends every ~30s.";
+    return `Click mic to start. Transcript appends every ~${chunkIntervalSeconds}s.`;
   }, [
     apiKeyReady,
     chunkIntervalSeconds,
