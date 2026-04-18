@@ -1,14 +1,20 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-const transcriptChunks = [
-  "So we're talking about how to scale our backend to handle a million concurrent users.",
-  "The main bottleneck right now is the websocket connections and how we're handling state in memory.",
-  "I read that companies like Discord shard by guild ID — should we do something similar by user cohort?",
-  "Also concerned about cost. If we move to managed Kafka, what's a realistic monthly bill at our volume?",
-  "And one more thing — what was the failure mode when Slack went down last year? I want to avoid that pattern.",
-];
+const SETTINGS_STORAGE_KEY = "meetmind.settings";
+const LEGACY_GROQ_KEY_STORAGE_KEY = "meetmind.groqApiKey";
+const DEFAULT_WHISPER_MODEL = "whisper-large-v3";
+const DEFAULT_SUGGESTION_MODEL = "openai/gpt-oss-120b";
+const DEFAULT_CHUNK_INTERVAL_SECONDS = 10;
+const MIN_CHUNK_INTERVAL_SECONDS = 5;
+const MAX_CHUNK_INTERVAL_SECONDS = 120;
+const MIN_AUDIO_CHUNK_BYTES = 2_048;
+const MIN_AUDIO_CHUNK_MS = 1_000;
+const AUDIO_ACTIVITY_SAMPLE_MS = 200;
+const MIN_SPEECH_RMS = 0.012;
+const MIN_SPEECH_SAMPLES = 2;
+const DUPLICATE_SIMILARITY_THRESHOLD = 0.86;
 
 const suggestionBatches = [
   [
@@ -34,6 +40,8 @@ type TranscriptLine = {
   id: number;
   time: string;
   text: string;
+  startedAt: string;
+  endedAt: string;
 };
 
 type RenderedBatch = {
@@ -53,8 +61,37 @@ type ChatMessage = {
   label?: string;
 };
 
-function timestamp() {
-  return new Date().toLocaleTimeString([], {
+type TranscriptionResponse = {
+  text?: string;
+  error?: string;
+};
+
+type StoredSettings = {
+  groqApiKey?: string;
+  whisperModel?: string;
+  suggestionModel?: string;
+  chunkIntervalSeconds?: number;
+};
+
+type ClientLogCategory = "app" | "client" | "audio" | "transcription" | "groq" | "errors";
+
+function emitClientLog(category: ClientLogCategory, event: string, data: Record<string, unknown> = {}) {
+  if (typeof window === "undefined") {
+    return;
+  }
+
+  void fetch("/api/logs", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ category, event, data }),
+    keepalive: true,
+  }).catch(() => undefined);
+}
+
+function timestamp(date = new Date()) {
+  return date.toLocaleTimeString([], {
     hour: "2-digit",
     minute: "2-digit",
     second: "2-digit",
@@ -74,21 +111,210 @@ function simulateAnswer(question: string) {
   return `Detailed answer to: "${question}"\n\nThis is where a separate, longer-form prompt runs against the chat model with full transcript context. Streamed response ideally. Candidates choose model + prompt strategy — we evaluate quality, latency, relevance.`;
 }
 
+function transcriptionErrorMessage(error: unknown) {
+  if (error instanceof Error) {
+    return error.message;
+  }
+
+  return "Something went wrong while transcribing audio.";
+}
+
+function microphoneErrorMessage(error: unknown) {
+  if (error instanceof DOMException) {
+    const browserError = `Browser returned ${error.name}${error.message ? `: ${error.message}` : ""}.`;
+
+    switch (error.name) {
+      case "NotAllowedError":
+      case "SecurityError":
+        return `${browserError} Microphone access is blocked. Check browser site settings and system microphone privacy settings, then fully restart the browser.`;
+      case "NotFoundError":
+      case "DevicesNotFoundError":
+        return `${browserError} No microphone was found. Connect a mic or choose an input device in your system settings.`;
+      case "NotReadableError":
+      case "TrackStartError":
+        return `${browserError} The microphone is unavailable. Close other apps using the mic, check system privacy settings, then try again.`;
+      case "OverconstrainedError":
+        return `${browserError} The selected microphone cannot satisfy the requested audio settings. Try another input device.`;
+      case "AbortError":
+        return `${browserError} The browser stopped the microphone request. Try clicking the mic again.`;
+      default:
+        return `${browserError} The browser could not start microphone recording.`;
+    }
+  }
+
+  if (error instanceof Error && error.message.toLowerCase().includes("permission")) {
+    return `Browser returned: ${error.message}. Microphone access is blocked. Check browser site settings and system microphone privacy settings, then fully restart the browser.`;
+  }
+
+  if (error instanceof Error) {
+    return error.message;
+  }
+
+  return "The browser could not start microphone recording.";
+}
+
+function getPreferredMimeType() {
+  if (typeof MediaRecorder === "undefined") {
+    return undefined;
+  }
+
+  const candidates = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/ogg;codecs=opus"];
+  return candidates.find((mimeType) => MediaRecorder.isTypeSupported(mimeType));
+}
+
+async function getMicrophonePermissionState() {
+  if (!navigator.permissions?.query) {
+    return null;
+  }
+
+  try {
+    const status = await navigator.permissions.query({ name: "microphone" as PermissionName });
+    return status.state;
+  } catch {
+    return null;
+  }
+}
+
+function extensionForMimeType(mimeType: string) {
+  if (mimeType.includes("mp4")) {
+    return "mp4";
+  }
+
+  if (mimeType.includes("ogg")) {
+    return "ogg";
+  }
+
+  return "webm";
+}
+
+function clampChunkInterval(value: number) {
+  if (!Number.isFinite(value)) {
+    return DEFAULT_CHUNK_INTERVAL_SECONDS;
+  }
+
+  return Math.min(MAX_CHUNK_INTERVAL_SECONDS, Math.max(MIN_CHUNK_INTERVAL_SECONDS, Math.round(value)));
+}
+
+function parseStoredSettings(value: string | null) {
+  if (!value) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(value) as StoredSettings;
+  } catch {
+    return null;
+  }
+}
+
+function normalizeTranscriptText(text: string) {
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function textSimilarity(first: string, second: string) {
+  const firstWords = new Set(normalizeTranscriptText(first).split(" ").filter(Boolean));
+  const secondWords = new Set(normalizeTranscriptText(second).split(" ").filter(Boolean));
+
+  if (firstWords.size === 0 || secondWords.size === 0) {
+    return 0;
+  }
+
+  let sharedWords = 0;
+  firstWords.forEach((word) => {
+    if (secondWords.has(word)) {
+      sharedWords += 1;
+    }
+  });
+
+  return sharedWords / Math.max(firstWords.size, secondWords.size);
+}
+
+function isLikelyWhisperOutroArtifact(text: string) {
+  const normalized = normalizeTranscriptText(text);
+  return /^(thank you|thank you for watching|you for watching|thanks for watching|thanks)$/.test(normalized);
+}
+
+function isLowInformationFragment(text: string) {
+  const words = normalizeTranscriptText(text).split(" ").filter(Boolean);
+
+  if (words.length === 0) {
+    return true;
+  }
+
+  if (words.length === 1 && words[0].length <= 10) {
+    return true;
+  }
+
+  return words.length <= 2 && words.join("").length <= 14;
+}
+
+function shouldSkipTranscriptText(text: string, recentLines: TranscriptLine[]) {
+  const normalized = normalizeTranscriptText(text);
+
+  if (!normalized || isLikelyWhisperOutroArtifact(text) || isLowInformationFragment(text)) {
+    return true;
+  }
+
+  return recentLines.slice(-4).some((line) => {
+    const previous = normalizeTranscriptText(line.text);
+
+    if (!previous) {
+      return false;
+    }
+
+    return (
+      previous === normalized ||
+      previous.endsWith(normalized) ||
+      normalized.endsWith(previous) ||
+      textSimilarity(line.text, text) >= DUPLICATE_SIMILARITY_THRESHOLD
+    );
+  });
+}
+
 export default function Home() {
   const [recording, setRecording] = useState(false);
+  const [requestingMic, setRequestingMic] = useState(false);
+  const [pendingTranscriptions, setPendingTranscriptions] = useState(0);
+  const [transcriptionError, setTranscriptionError] = useState<string | null>(null);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [groqApiKey, setGroqApiKey] = useState("");
+  const [whisperModel, setWhisperModel] = useState(DEFAULT_WHISPER_MODEL);
+  const [suggestionModel, setSuggestionModel] = useState(DEFAULT_SUGGESTION_MODEL);
+  const [chunkIntervalSeconds, setChunkIntervalSeconds] = useState(DEFAULT_CHUNK_INTERVAL_SECONDS);
   const [transcriptLines, setTranscriptLines] = useState<TranscriptLine[]>([]);
   const [renderedBatches, setRenderedBatches] = useState<RenderedBatch[]>([]);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [chatInput, setChatInput] = useState("");
-  const [countdown, setCountdown] = useState(30);
+  const [countdown, setCountdown] = useState(DEFAULT_CHUNK_INTERVAL_SECONDS);
 
-  const transcriptIndexRef = useRef(0);
   const batchIndexRef = useRef(0);
   const messageIdRef = useRef(0);
-  const recordingTimerRef = useRef<number | null>(null);
+  const transcriptIdRef = useRef(0);
   const countdownTimerRef = useRef<number | null>(null);
+  const segmentTimerRef = useRef<number | null>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const shouldContinueRecordingRef = useRef(false);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const audioSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const audioAnalyserRef = useRef<AnalyserNode | null>(null);
+  const audioActivityTimerRef = useRef<number | null>(null);
+  const segmentSpeechSamplesRef = useRef(0);
+  const segmentTotalSamplesRef = useRef(0);
+  const segmentMaxRmsRef = useRef(0);
+  const transcriptionQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const groqApiKeyRef = useRef("");
+  const whisperModelRef = useRef(DEFAULT_WHISPER_MODEL);
+  const chunkIntervalSecondsRef = useRef(DEFAULT_CHUNK_INTERVAL_SECONDS);
+  const transcriptLinesRef = useRef<TranscriptLine[]>([]);
   const transcriptBodyRef = useRef<HTMLDivElement>(null);
   const chatBodyRef = useRef<HTMLDivElement>(null);
+
+  const apiKeyReady = groqApiKey.trim().length > 0;
 
   const addSuggestionBatch = useCallback(() => {
     const batch = suggestionBatches[batchIndexRef.current % suggestionBatches.length];
@@ -106,56 +332,434 @@ export default function Home() {
     ]);
   }, []);
 
-  const addTranscriptChunk = useCallback(() => {
-    const chunk = transcriptChunks[transcriptIndexRef.current % transcriptChunks.length];
-    transcriptIndexRef.current += 1;
-    const nextIndex = transcriptIndexRef.current;
-
-    setTranscriptLines((current) => [
-      ...current,
-      {
-        id: nextIndex,
-        time: timestamp(),
-        text: chunk,
-      },
-    ]);
-
-    if (nextIndex % 2 === 0) {
-      addSuggestionBatch();
-    }
-  }, [addSuggestionBatch]);
-
   const tickCountdown = useCallback(() => {
     setCountdown((current) => {
       if (current <= 1) {
         addSuggestionBatch();
-        return 30;
+        return chunkIntervalSecondsRef.current;
       }
 
       return current - 1;
     });
   }, [addSuggestionBatch]);
 
-  const stopRecording = useCallback(() => {
-    setRecording(false);
-
-    if (recordingTimerRef.current !== null) {
-      window.clearInterval(recordingTimerRef.current);
-      recordingTimerRef.current = null;
-    }
-
+  const clearCountdownTimer = useCallback(() => {
     if (countdownTimerRef.current !== null) {
       window.clearInterval(countdownTimerRef.current);
       countdownTimerRef.current = null;
     }
   }, []);
 
-  const startRecording = useCallback(() => {
-    setRecording(true);
-    addTranscriptChunk();
-    recordingTimerRef.current = window.setInterval(addTranscriptChunk, 6000);
-    countdownTimerRef.current = window.setInterval(tickCountdown, 1000);
-  }, [addTranscriptChunk, tickCountdown]);
+  const clearSegmentTimer = useCallback(() => {
+    if (segmentTimerRef.current !== null) {
+      window.clearTimeout(segmentTimerRef.current);
+      segmentTimerRef.current = null;
+    }
+  }, []);
+
+  const clearAudioActivityTimer = useCallback(() => {
+    if (audioActivityTimerRef.current !== null) {
+      window.clearInterval(audioActivityTimerRef.current);
+      audioActivityTimerRef.current = null;
+    }
+  }, []);
+
+  const resetSegmentAudioActivity = useCallback(() => {
+    segmentSpeechSamplesRef.current = 0;
+    segmentTotalSamplesRef.current = 0;
+    segmentMaxRmsRef.current = 0;
+  }, []);
+
+  const hasSegmentSpeechActivity = useCallback(() => {
+    if (!audioAnalyserRef.current) {
+      return true;
+    }
+
+    return segmentSpeechSamplesRef.current >= MIN_SPEECH_SAMPLES && segmentMaxRmsRef.current >= MIN_SPEECH_RMS;
+  }, []);
+
+  const stopAudioActivityMonitor = useCallback(() => {
+    clearAudioActivityTimer();
+    audioSourceRef.current?.disconnect();
+    audioSourceRef.current = null;
+    audioAnalyserRef.current = null;
+
+    if (audioContextRef.current) {
+      void audioContextRef.current.close();
+      audioContextRef.current = null;
+    }
+  }, [clearAudioActivityTimer]);
+
+  const startAudioActivityMonitor = useCallback(
+    (stream: MediaStream) => {
+      stopAudioActivityMonitor();
+
+      const AudioContextConstructor =
+        window.AudioContext ?? (window as Window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+
+      if (!AudioContextConstructor) {
+        return;
+      }
+
+      const audioContext = new AudioContextConstructor();
+      const analyser = audioContext.createAnalyser();
+      const source = audioContext.createMediaStreamSource(stream);
+
+      analyser.fftSize = 1024;
+      const samples = new Uint8Array(analyser.fftSize);
+      source.connect(analyser);
+
+      audioContextRef.current = audioContext;
+      audioSourceRef.current = source;
+      audioAnalyserRef.current = analyser;
+
+      if (audioContext.state === "suspended") {
+        void audioContext.resume();
+      }
+
+      audioActivityTimerRef.current = window.setInterval(() => {
+        analyser.getByteTimeDomainData(samples);
+
+        let sumSquares = 0;
+
+        samples.forEach((sample) => {
+          const centered = (sample - 128) / 128;
+          sumSquares += centered * centered;
+        });
+
+        const rms = Math.sqrt(sumSquares / samples.length);
+        segmentTotalSamplesRef.current += 1;
+        segmentMaxRmsRef.current = Math.max(segmentMaxRmsRef.current, rms);
+
+        if (rms >= MIN_SPEECH_RMS) {
+          segmentSpeechSamplesRef.current += 1;
+        }
+      }, AUDIO_ACTIVITY_SAMPLE_MS);
+    },
+    [stopAudioActivityMonitor],
+  );
+
+  const stopMediaStream = useCallback(() => {
+    mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
+    mediaStreamRef.current = null;
+  }, []);
+
+  const appendTranscriptLine = useCallback((text: string, startedAt: Date, endedAt: Date) => {
+    const currentLines = transcriptLinesRef.current;
+
+    if (shouldSkipTranscriptText(text, currentLines)) {
+      emitClientLog("transcription", "transcript_text_filtered", {
+        text,
+        textLength: text.length,
+        recentLineCount: currentLines.length,
+      });
+      return;
+    }
+
+    transcriptIdRef.current += 1;
+    const id = transcriptIdRef.current;
+    const line = {
+      id,
+      time: timestamp(endedAt),
+      text,
+      startedAt: startedAt.toISOString(),
+      endedAt: endedAt.toISOString(),
+    };
+
+    setTranscriptLines((current) => {
+      const nextLines = [...current, line];
+      transcriptLinesRef.current = nextLines;
+      return nextLines;
+    });
+
+    emitClientLog("transcription", "transcript_text_appended", {
+      id,
+      textLength: text.length,
+      startedAt: line.startedAt,
+      endedAt: line.endedAt,
+    });
+  }, []);
+
+  const transcribeAudioChunk = useCallback(
+    async (blob: Blob, startedAt: Date, endedAt: Date) => {
+      const apiKey = groqApiKeyRef.current;
+
+      if (!apiKey) {
+        setTranscriptionError("Paste a Groq API key before starting the mic.");
+        emitClientLog("errors", "transcription_not_started_missing_api_key");
+        return;
+      }
+
+      setPendingTranscriptions((current) => current + 1);
+      setTranscriptionError(null);
+
+      try {
+        const formData = new FormData();
+        const mimeType = blob.type || "audio/webm";
+        const fileName = `meeting-${startedAt.getTime()}.${extensionForMimeType(mimeType)}`;
+        const model = whisperModelRef.current || DEFAULT_WHISPER_MODEL;
+
+        formData.append("audio", blob, fileName);
+        formData.append("model", model);
+
+        emitClientLog("transcription", "transcription_request_started", {
+          fileName,
+          model,
+          audioType: mimeType,
+          audioSize: blob.size,
+          startedAt: startedAt.toISOString(),
+          endedAt: endedAt.toISOString(),
+        });
+
+        const response = await fetch("/api/transcribe", {
+          method: "POST",
+          headers: {
+            "x-groq-api-key": apiKey,
+          },
+          body: formData,
+        });
+        const payload = (await response.json().catch(() => null)) as TranscriptionResponse | null;
+
+        if (!response.ok) {
+          throw new Error(payload?.error ?? "Transcription failed.");
+        }
+
+        const text = payload?.text?.trim();
+
+        emitClientLog("transcription", "transcription_response_received", {
+          status: response.status,
+          textLength: text?.length ?? 0,
+          audioSize: blob.size,
+        });
+
+        if (text) {
+          appendTranscriptLine(text, startedAt, endedAt);
+        }
+      } catch (error) {
+        setTranscriptionError(transcriptionErrorMessage(error));
+        emitClientLog("errors", "transcription_request_failed", {
+          error: transcriptionErrorMessage(error),
+          audioSize: blob.size,
+          startedAt: startedAt.toISOString(),
+          endedAt: endedAt.toISOString(),
+        });
+      } finally {
+        setPendingTranscriptions((current) => Math.max(0, current - 1));
+      }
+    },
+    [appendTranscriptLine],
+  );
+
+  const enqueueTranscription = useCallback(
+    (blob: Blob, startedAt: Date, endedAt: Date) => {
+      emitClientLog("audio", "audio_chunk_enqueued", {
+        audioType: blob.type || "unknown",
+        audioSize: blob.size,
+        startedAt: startedAt.toISOString(),
+        endedAt: endedAt.toISOString(),
+      });
+
+      transcriptionQueueRef.current = transcriptionQueueRef.current
+        .catch(() => undefined)
+        .then(() => transcribeAudioChunk(blob, startedAt, endedAt));
+    },
+    [transcribeAudioChunk],
+  );
+
+  const startRecorderSegment = useCallback(
+    (stream: MediaStream) => {
+      const mimeType = getPreferredMimeType();
+      const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+      const audioParts: Blob[] = [];
+      const startedAt = new Date();
+
+      mediaRecorderRef.current = recorder;
+      resetSegmentAudioActivity();
+
+      emitClientLog("audio", "recorder_segment_started", {
+        mimeType: mimeType || recorder.mimeType || "browser-default",
+        startedAt: startedAt.toISOString(),
+        chunkIntervalSeconds: chunkIntervalSecondsRef.current,
+      });
+
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          audioParts.push(event.data);
+        }
+      };
+
+      recorder.onerror = () => {
+        setTranscriptionError("The browser stopped recording audio.");
+      };
+
+      recorder.onstop = () => {
+        clearSegmentTimer();
+
+        if (mediaRecorderRef.current === recorder) {
+          mediaRecorderRef.current = null;
+        }
+
+        const endedAt = new Date();
+        const durationMs = endedAt.getTime() - startedAt.getTime();
+        const recordedMimeType = recorder.mimeType || mimeType || audioParts[0]?.type || "audio/webm";
+        const audioBlob = new Blob(audioParts, { type: recordedMimeType });
+        const hasSpeech = hasSegmentSpeechActivity();
+        const audioStats = {
+          audioType: recordedMimeType,
+          audioSize: audioBlob.size,
+          durationMs,
+          speechSamples: segmentSpeechSamplesRef.current,
+          totalSamples: segmentTotalSamplesRef.current,
+          maxRms: Number(segmentMaxRmsRef.current.toFixed(5)),
+        };
+
+        if (audioBlob.size >= MIN_AUDIO_CHUNK_BYTES && durationMs >= MIN_AUDIO_CHUNK_MS && hasSpeech) {
+          emitClientLog("audio", "audio_chunk_ready", audioStats);
+          enqueueTranscription(audioBlob, startedAt, endedAt);
+        } else {
+          emitClientLog("audio", "audio_chunk_skipped", {
+            ...audioStats,
+            reason:
+              audioBlob.size < MIN_AUDIO_CHUNK_BYTES
+                ? "too_small"
+                : durationMs < MIN_AUDIO_CHUNK_MS
+                  ? "too_short"
+                  : "no_speech_activity",
+          });
+        }
+
+        if (
+          shouldContinueRecordingRef.current &&
+          mediaStreamRef.current === stream &&
+          stream.getAudioTracks().some((track) => track.readyState === "live")
+        ) {
+          startRecorderSegment(stream);
+          return;
+        }
+
+        stopAudioActivityMonitor();
+        stopMediaStream();
+      };
+
+      recorder.start();
+      segmentTimerRef.current = window.setTimeout(() => {
+        if (recorder.state === "recording") {
+          recorder.stop();
+        }
+      }, chunkIntervalSecondsRef.current * 1000);
+    },
+    [
+      clearSegmentTimer,
+      enqueueTranscription,
+      hasSegmentSpeechActivity,
+      resetSegmentAudioActivity,
+      stopAudioActivityMonitor,
+      stopMediaStream,
+    ],
+  );
+
+  const stopRecording = useCallback(() => {
+    setRecording(false);
+    shouldContinueRecordingRef.current = false;
+    emitClientLog("client", "recording_stop_requested");
+    clearCountdownTimer();
+    clearSegmentTimer();
+
+    const recorder = mediaRecorderRef.current;
+
+    if (recorder && recorder.state !== "inactive") {
+      recorder.stop();
+      return;
+    }
+
+    mediaRecorderRef.current = null;
+    stopAudioActivityMonitor();
+    stopMediaStream();
+  }, [clearCountdownTimer, clearSegmentTimer, stopAudioActivityMonitor, stopMediaStream]);
+
+  const startRecording = useCallback(async () => {
+    if (recording || requestingMic) {
+      return;
+    }
+
+    if (!apiKeyReady) {
+      setTranscriptionError("Paste a Groq API key before starting the mic.");
+      emitClientLog("errors", "recording_blocked_missing_api_key");
+      return;
+    }
+
+    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
+      setTranscriptionError("This browser does not support microphone recording.");
+      emitClientLog("errors", "recording_blocked_browser_unsupported");
+      return;
+    }
+
+    if (!window.isSecureContext) {
+      setTranscriptionError("Microphone recording requires HTTPS or localhost. Open http://localhost:3000 instead of the network URL.");
+      emitClientLog("errors", "recording_blocked_insecure_context", {
+        location: window.location.href,
+      });
+      return;
+    }
+
+    setRequestingMic(true);
+    setTranscriptionError(null);
+    emitClientLog("client", "recording_start_requested", {
+      chunkIntervalSeconds: chunkIntervalSecondsRef.current,
+      whisperModel: whisperModelRef.current,
+    });
+
+    try {
+      const permissionState = await getMicrophonePermissionState();
+
+      emitClientLog("client", "microphone_permission_state_checked", {
+        permissionState: permissionState ?? "unknown",
+      });
+
+      if (permissionState === "denied") {
+        throw new DOMException("Browser permission state is denied for this site.", "NotAllowedError");
+      }
+
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+      mediaStreamRef.current = stream;
+      shouldContinueRecordingRef.current = true;
+      startAudioActivityMonitor(stream);
+
+      const chunkInterval = chunkIntervalSecondsRef.current;
+
+      startRecorderSegment(stream);
+      setRecording(true);
+      setCountdown(chunkInterval);
+      clearCountdownTimer();
+      countdownTimerRef.current = window.setInterval(tickCountdown, 1000);
+      emitClientLog("client", "recording_started", {
+        chunkIntervalSeconds: chunkInterval,
+        trackCount: stream.getAudioTracks().length,
+      });
+    } catch (error) {
+      shouldContinueRecordingRef.current = false;
+      clearSegmentTimer();
+      stopAudioActivityMonitor();
+      stopMediaStream();
+      setTranscriptionError(microphoneErrorMessage(error));
+      emitClientLog("errors", "recording_start_failed", {
+        error: microphoneErrorMessage(error),
+      });
+    } finally {
+      setRequestingMic(false);
+    }
+  }, [
+    apiKeyReady,
+    clearCountdownTimer,
+    recording,
+    requestingMic,
+    startRecorderSegment,
+    startAudioActivityMonitor,
+    stopAudioActivityMonitor,
+    stopMediaStream,
+    tickCountdown,
+  ]);
 
   const handleMicClick = useCallback(() => {
     if (recording) {
@@ -163,7 +767,7 @@ export default function Home() {
       return;
     }
 
-    startRecording();
+    void startRecording();
   }, [recording, startRecording, stopRecording]);
 
   const addChatMessage = useCallback((who: ChatMessage["who"], text: string, label?: string) => {
@@ -191,7 +795,7 @@ export default function Home() {
 
   const handleReload = useCallback(() => {
     addSuggestionBatch();
-    setCountdown(30);
+    setCountdown(chunkIntervalSecondsRef.current);
   }, [addSuggestionBatch]);
 
   const handleChatSend = useCallback(() => {
@@ -205,8 +809,172 @@ export default function Home() {
     setChatInput("");
   }, [chatInput, sendToChat]);
 
+  const handleGroqApiKeyChange = useCallback((value: string) => {
+    setGroqApiKey(value);
+    emitClientLog("app", "settings_groq_api_key_changed", {
+      hasKey: value.trim().length > 0,
+    });
+  }, []);
+
+  const handleChunkIntervalChange = useCallback((value: string) => {
+    const nextInterval = clampChunkInterval(Number(value));
+
+    setChunkIntervalSeconds(nextInterval);
+    emitClientLog("app", "settings_chunk_interval_changed", {
+      chunkIntervalSeconds: nextInterval,
+    });
+
+    if (!recording) {
+      setCountdown(nextInterval);
+    }
+  }, [recording]);
+
+  const handleResetDefaults = useCallback(() => {
+    setWhisperModel(DEFAULT_WHISPER_MODEL);
+    setSuggestionModel(DEFAULT_SUGGESTION_MODEL);
+    setChunkIntervalSeconds(DEFAULT_CHUNK_INTERVAL_SECONDS);
+    emitClientLog("app", "settings_reset_defaults");
+
+    if (!recording) {
+      setCountdown(DEFAULT_CHUNK_INTERVAL_SECONDS);
+    }
+  }, [recording]);
+
+  const handleCloseSettings = useCallback(() => {
+    setSettingsOpen(false);
+  }, []);
+
+  const recState = useMemo(() => {
+    if (requestingMic) {
+      return "requesting mic";
+    }
+
+    if (recording) {
+      return "● recording";
+    }
+
+    if (pendingTranscriptions > 0) {
+      return "transcribing";
+    }
+
+    return "idle";
+  }, [pendingTranscriptions, recording, requestingMic]);
+
+  const micStatus = useMemo(() => {
+    if (transcriptionError) {
+      return transcriptionError;
+    }
+
+    if (!apiKeyReady) {
+      return "Open Settings to add your Groq API key before recording.";
+    }
+
+    if (requestingMic) {
+      return "Requesting microphone permission…";
+    }
+
+    if (recording && pendingTranscriptions > 0) {
+      return "Listening… transcribing the latest audio chunk.";
+    }
+
+    if (recording) {
+      return `Listening… transcript updates every ${chunkIntervalSeconds}s.`;
+    }
+
+    if (pendingTranscriptions > 0) {
+      return "Stopped. Transcribing the final audio chunk.";
+    }
+
+    if (transcriptLines.length > 0) {
+      return "Stopped. Click to resume.";
+    }
+
+    return "Click mic to start. Transcript appends every ~30s.";
+  }, [
+    apiKeyReady,
+    chunkIntervalSeconds,
+    pendingTranscriptions,
+    recording,
+    requestingMic,
+    transcriptLines.length,
+    transcriptionError,
+  ]);
+
+  useEffect(() => {
+    const storedSettings = parseStoredSettings(window.sessionStorage.getItem(SETTINGS_STORAGE_KEY));
+    const storedLegacyKey = window.sessionStorage.getItem(LEGACY_GROQ_KEY_STORAGE_KEY);
+
+    if (storedSettings?.groqApiKey || storedLegacyKey) {
+      setGroqApiKey(storedSettings?.groqApiKey ?? storedLegacyKey ?? "");
+    }
+
+    if (storedSettings?.whisperModel) {
+      setWhisperModel(storedSettings.whisperModel);
+    }
+
+    if (storedSettings?.suggestionModel) {
+      setSuggestionModel(storedSettings.suggestionModel);
+    }
+
+    if (storedSettings?.chunkIntervalSeconds) {
+      const nextInterval = clampChunkInterval(storedSettings.chunkIntervalSeconds);
+      setChunkIntervalSeconds(nextInterval);
+      setCountdown(nextInterval);
+    }
+
+    emitClientLog("app", "app_loaded", {
+      restoredSettings: Boolean(storedSettings),
+      restoredLegacyKey: Boolean(storedLegacyKey),
+    });
+  }, []);
+
+  useEffect(() => {
+    const settings: StoredSettings = {
+      groqApiKey,
+      whisperModel,
+      suggestionModel,
+      chunkIntervalSeconds,
+    };
+
+    window.sessionStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settings));
+
+    if (groqApiKey.trim()) {
+      window.sessionStorage.setItem(LEGACY_GROQ_KEY_STORAGE_KEY, groqApiKey);
+    } else {
+      window.sessionStorage.removeItem(LEGACY_GROQ_KEY_STORAGE_KEY);
+    }
+  }, [chunkIntervalSeconds, groqApiKey, suggestionModel, whisperModel]);
+
+  useEffect(() => {
+    groqApiKeyRef.current = groqApiKey.trim();
+  }, [groqApiKey]);
+
+  useEffect(() => {
+    whisperModelRef.current = whisperModel.trim() || DEFAULT_WHISPER_MODEL;
+  }, [whisperModel]);
+
+  useEffect(() => {
+    chunkIntervalSecondsRef.current = clampChunkInterval(chunkIntervalSeconds);
+  }, [chunkIntervalSeconds]);
+
+  useEffect(() => {
+    if (!settingsOpen) {
+      return undefined;
+    }
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setSettingsOpen(false);
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [settingsOpen]);
+
   useEffect(() => {
     const transcriptBody = transcriptBodyRef.current;
+    transcriptLinesRef.current = transcriptLines;
 
     if (transcriptBody) {
       transcriptBody.scrollTop = transcriptBody.scrollHeight;
@@ -223,13 +991,41 @@ export default function Home() {
 
   useEffect(() => {
     return () => {
-      if (recordingTimerRef.current !== null) {
-        window.clearInterval(recordingTimerRef.current);
-      }
+      emitClientLog("app", "app_unloaded");
+      shouldContinueRecordingRef.current = false;
 
       if (countdownTimerRef.current !== null) {
         window.clearInterval(countdownTimerRef.current);
+        countdownTimerRef.current = null;
       }
+
+      if (segmentTimerRef.current !== null) {
+        window.clearTimeout(segmentTimerRef.current);
+        segmentTimerRef.current = null;
+      }
+
+      if (audioActivityTimerRef.current !== null) {
+        window.clearInterval(audioActivityTimerRef.current);
+        audioActivityTimerRef.current = null;
+      }
+
+      const recorder = mediaRecorderRef.current;
+
+      if (recorder && recorder.state !== "inactive") {
+        recorder.stop();
+      }
+
+      audioSourceRef.current?.disconnect();
+      audioSourceRef.current = null;
+      audioAnalyserRef.current = null;
+
+      if (audioContextRef.current) {
+        void audioContextRef.current.close();
+        audioContextRef.current = null;
+      }
+
+      mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
+      mediaStreamRef.current = null;
     };
   }, []);
 
@@ -237,33 +1033,121 @@ export default function Home() {
     <>
       <div className="topbar">
         <h1>TwinMind — Live Suggestions Web App (Reference Mockup)</h1>
-        <div className="meta">3-column layout · Transcript · Live Suggestions · Chat</div>
+        <div className="topbar-actions">
+          <div className="meta">3-column layout · Transcript · Live Suggestions · Chat</div>
+          <button className="settings-btn" onClick={() => setSettingsOpen(true)} type="button">
+            Settings
+          </button>
+        </div>
       </div>
+
+      {settingsOpen ? (
+        <div
+          className="settings-backdrop"
+          onMouseDown={(event) => {
+            if (event.currentTarget === event.target) {
+              handleCloseSettings();
+            }
+          }}
+        >
+          <div aria-labelledby="settingsTitle" aria-modal="true" className="settings-modal" role="dialog">
+            <div className="settings-header">
+              <h2 id="settingsTitle">Settings</h2>
+              <button
+                aria-label="Close settings"
+                className="settings-close"
+                onClick={handleCloseSettings}
+                type="button"
+              >
+                ×
+              </button>
+            </div>
+
+            <div className="settings-fields">
+              <label className="settings-field" htmlFor="groqApiKey">
+                <span>Groq API key</span>
+                <input
+                  autoComplete="off"
+                  id="groqApiKey"
+                  onChange={(event) => handleGroqApiKeyChange(event.target.value)}
+                  placeholder="gsk_..."
+                  type="password"
+                  value={groqApiKey}
+                />
+              </label>
+
+              <label className="settings-field" htmlFor="whisperModel">
+                <span>Whisper model</span>
+                <input
+                  id="whisperModel"
+                  onChange={(event) => setWhisperModel(event.target.value)}
+                  value={whisperModel}
+                />
+              </label>
+
+              <label className="settings-field" htmlFor="suggestionModel">
+                <span>Suggestion model</span>
+                <input
+                  id="suggestionModel"
+                  onChange={(event) => setSuggestionModel(event.target.value)}
+                  value={suggestionModel}
+                />
+              </label>
+
+              <label className="settings-field" htmlFor="chunkIntervalSeconds">
+                <span>Chunk interval</span>
+                <div className="number-input-wrap">
+                  <input
+                    id="chunkIntervalSeconds"
+                    max={MAX_CHUNK_INTERVAL_SECONDS}
+                    min={MIN_CHUNK_INTERVAL_SECONDS}
+                    onChange={(event) => handleChunkIntervalChange(event.target.value)}
+                    step={1}
+                    type="number"
+                    value={chunkIntervalSeconds}
+                  />
+                  <span>seconds</span>
+                </div>
+              </label>
+            </div>
+
+            <div className="settings-footer">
+              <button className="settings-secondary" onClick={handleResetDefaults} type="button">
+                Reset defaults
+              </button>
+              <button className="settings-primary" onClick={handleCloseSettings} type="button">
+                Done
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
 
       <div className="layout">
         <div className="col">
           <header>
             <span>1. Mic & Transcript</span>
-            <span id="recState">{recording ? "● recording" : "idle"}</span>
+            <span id="recState">{recState}</span>
           </header>
           <div className="mic-wrap">
             <button
               id="micBtn"
               className={`mic-btn${recording ? " recording" : ""}`}
+              disabled={requestingMic}
               title="Start / stop recording"
               type="button"
               onClick={handleMicClick}
             >
               ●
             </button>
-            <div className="mic-status" id="micStatus">
-              {recording ? "Listening… transcript updates every 30s." : transcriptLines.length > 0 ? "Stopped. Click to resume." : "Click mic to start. Transcript appends every ~30s."}
+            <div className={`mic-status${transcriptionError ? " status-error" : ""}`} id="micStatus">
+              {micStatus}
             </div>
           </div>
           <div className="body" id="transcriptBody" ref={transcriptBodyRef}>
             <div className="help-banner">
-              The transcript scrolls and appends new chunks every ~30 seconds while recording. Use the mic
-              button to start/stop. Include an export button (not shown) so we can pull the full session.
+              The transcript scrolls and appends new chunks every ~{chunkIntervalSeconds} seconds while
+              recording. Audio is captured from the mic and transcribed with Groq Whisper Large V3.
             </div>
             {transcriptLines.length === 0 ? (
               <div className="empty" id="transcriptEmpty">

@@ -3,10 +3,12 @@ node_modules
 out
 dist
 coverage
+/logs/
 tsconfig.tsbuildinfo
 .env
 .env.local
 .env.*.local
+grok_api.txt
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
