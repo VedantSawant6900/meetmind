@@ -46,6 +46,7 @@ The app is designed as a three-column workspace:
 app/
   api/
     chat/route.ts          Detailed chat answers
+    developer-mode/route.ts Settings unlock for prompt/context controls
     logs/route.ts          Browser-to-server log ingestion
     suggestions/route.ts   Live suggestion generation
     transcribe/route.ts    Audio transcription
@@ -53,6 +54,8 @@ app/
   page.tsx                 Main three-column interface
 lib/
   default-prompts.ts      Shared default prompts
+  groq-retry.ts          Groq retry helper
+  meeting-context.ts     Transcript cue extraction and relevance selection
   server-logger.ts         Rotating JSONL logger
 README.md
 package.json
@@ -114,11 +117,12 @@ The top-right **Settings** modal controls the runtime model parameters:
 | Transcript language | `en` | Sent to Whisper to prefer English transcription. |
 | Suggestion model | `openai/gpt-oss-120b` | Used for live suggestions and chat answers. |
 | Chunk interval | `30` seconds | How often audio is chunked, transcribed, and used for refresh timing. |
-| Live suggestion context window | `18` lines | Number of recent transcript lines used for each suggestion batch. |
-| Expanded answer context window | `80` lines | Number of recent transcript lines used when opening a suggestion or asking chat. |
-| Live suggestion prompt | built-in default | Controls exactly three short, useful suggestion previews. |
-| Detailed answer prompt | built-in default | Controls expanded answers when a suggestion card is clicked. |
-| Chat prompt | built-in default | Controls direct typed questions in the right column. |
+| Developer mode | `1234` demo password | Unlocks prompt and context-window editing. |
+| Live suggestion context window | `18` lines | Developer-mode control for each suggestion batch. |
+| Expanded answer context window | `80` lines | Developer-mode control for clicked suggestions and typed chat. |
+| Live suggestion prompt | built-in default | Developer-mode control for three short suggestion previews. |
+| Detailed answer prompt | built-in default | Developer-mode control for expanded clicked-suggestion answers. |
+| Chat prompt | built-in default | Developer-mode control for direct typed questions. |
 
 Settings are stored in browser session storage, not committed to the repository.
 
@@ -130,6 +134,18 @@ Create `.env.local` if you want a local fallback key:
 
 ```bash
 GROQ_API_KEY=your_groq_key_here
+```
+
+Developer mode checks the password on the server. The committed demo fallback unlocks with `1234`; for any real deployment, override it with a SHA-256 password hash:
+
+```bash
+DEVELOPER_MODE_PASSWORD_HASH=your_sha256_hex_hash_here
+```
+
+Generate a hash locally with:
+
+```bash
+node -e "const crypto=require('crypto'); console.log(crypto.createHash('sha256').update(process.argv[1]).digest('hex'))" "your-password"
 ```
 
 `.env.local` is ignored by git.
@@ -276,6 +292,7 @@ Whisper model: whisper-large-v3
 Transcript language: en
 Suggestion model: openai/gpt-oss-120b
 Chunk interval: 30
+Developer mode password: 1234
 Live suggestion context window: 18
 Expanded answer context window: 80
 ```

@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
@@ -83,6 +83,11 @@ type SuggestionsResponse = {
 type ChatResponse = {
   answer?: string;
   finishReason?: string | null;
+  error?: string;
+};
+
+type DeveloperModeResponse = {
+  unlocked?: boolean;
   error?: string;
 };
 
@@ -447,6 +452,10 @@ export default function Home() {
   const [pendingTranscriptions, setPendingTranscriptions] = useState(0);
   const [transcriptionError, setTranscriptionError] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [developerModeUnlocked, setDeveloperModeUnlocked] = useState(false);
+  const [developerModePassword, setDeveloperModePassword] = useState("");
+  const [developerModeError, setDeveloperModeError] = useState<string | null>(null);
+  const [developerModeLoading, setDeveloperModeLoading] = useState(false);
   const [groqApiKey, setGroqApiKey] = useState("");
   const [whisperModel, setWhisperModel] = useState(DEFAULT_WHISPER_MODEL);
   const [transcriptionLanguage, setTranscriptionLanguage] = useState(DEFAULT_TRANSCRIPTION_LANGUAGE);
@@ -486,6 +495,7 @@ export default function Home() {
   const currentSegmentStartedAtRef = useRef<Date | null>(null);
   const transcriptionQueueRef = useRef<Promise<void>>(Promise.resolve());
   const groqApiKeyRef = useRef("");
+  const developerModeUnlockedRef = useRef(false);
   const whisperModelRef = useRef(DEFAULT_WHISPER_MODEL);
   const transcriptionLanguageRef = useRef(DEFAULT_TRANSCRIPTION_LANGUAGE);
   const suggestionModelRef = useRef(DEFAULT_SUGGESTION_MODEL);
@@ -1371,17 +1381,99 @@ export default function Home() {
     });
   }, [renderedBatches]);
 
+  const refreshDeveloperModeState = useCallback(async () => {
+    try {
+      const response = await fetch("/api/developer-mode", {
+        method: "GET",
+      });
+      const payload = (await response.json().catch(() => null)) as DeveloperModeResponse | null;
+
+      setDeveloperModeUnlocked(Boolean(response.ok && payload?.unlocked));
+      setDeveloperModeError(null);
+    } catch {
+      setDeveloperModeUnlocked(false);
+      setDeveloperModeError("Could not check developer mode.");
+    }
+  }, []);
+
+  const handleDeveloperModeUnlock = useCallback(async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+
+    if (developerModeLoading) {
+      return;
+    }
+
+    const password = developerModePassword.trim();
+
+    if (!password) {
+      setDeveloperModeError("Enter the developer mode password.");
+      return;
+    }
+
+    setDeveloperModeLoading(true);
+    setDeveloperModeError(null);
+
+    try {
+      const response = await fetch("/api/developer-mode", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ password }),
+      });
+      const payload = (await response.json().catch(() => null)) as DeveloperModeResponse | null;
+
+      if (!response.ok || !payload?.unlocked) {
+        throw new Error(payload?.error ?? "Developer mode unlock failed.");
+      }
+
+      setDeveloperModeUnlocked(true);
+      setDeveloperModePassword("");
+      emitClientLog("app", "developer_mode_unlocked");
+    } catch (error) {
+      setDeveloperModeUnlocked(false);
+      setDeveloperModeError(error instanceof Error ? error.message : "Developer mode unlock failed.");
+      emitClientLog("errors", "developer_mode_unlock_failed");
+    } finally {
+      setDeveloperModeLoading(false);
+    }
+  }, [developerModeLoading, developerModePassword]);
+
+  const handleDeveloperModeLock = useCallback(async () => {
+    setDeveloperModeLoading(true);
+    setDeveloperModeError(null);
+
+    try {
+      await fetch("/api/developer-mode", {
+        method: "DELETE",
+      });
+    } finally {
+      setDeveloperModeUnlocked(false);
+      setDeveloperModePassword("");
+      setDeveloperModeLoading(false);
+      emitClientLog("app", "developer_mode_locked");
+    }
+  }, []);
+
   const handleResetDefaults = useCallback(() => {
+    const resetDeveloperSettings = developerModeUnlockedRef.current;
+
     setWhisperModel(DEFAULT_WHISPER_MODEL);
     setTranscriptionLanguage(DEFAULT_TRANSCRIPTION_LANGUAGE);
     setSuggestionModel(DEFAULT_SUGGESTION_MODEL);
     setChunkIntervalSeconds(DEFAULT_CHUNK_INTERVAL_SECONDS);
-    setSuggestionContextLines(DEFAULT_SUGGESTION_CONTEXT_LINES);
-    setDetailContextLines(DEFAULT_DETAIL_CONTEXT_LINES);
-    setLiveSuggestionPrompt(DEFAULT_LIVE_SUGGESTION_PROMPT);
-    setDetailAnswerPrompt(DEFAULT_DETAIL_ANSWER_PROMPT);
-    setChatPrompt(DEFAULT_CHAT_PROMPT);
-    emitClientLog("app", "settings_reset_defaults");
+
+    if (resetDeveloperSettings) {
+      setSuggestionContextLines(DEFAULT_SUGGESTION_CONTEXT_LINES);
+      setDetailContextLines(DEFAULT_DETAIL_CONTEXT_LINES);
+      setLiveSuggestionPrompt(DEFAULT_LIVE_SUGGESTION_PROMPT);
+      setDetailAnswerPrompt(DEFAULT_DETAIL_ANSWER_PROMPT);
+      setChatPrompt(DEFAULT_CHAT_PROMPT);
+    }
+
+    emitClientLog("app", "settings_reset_defaults", {
+      resetDeveloperSettings,
+    });
 
     if (!recording) {
       setCountdown(DEFAULT_CHUNK_INTERVAL_SECONDS);
@@ -1539,6 +1631,10 @@ export default function Home() {
   }, [groqApiKey]);
 
   useEffect(() => {
+    developerModeUnlockedRef.current = developerModeUnlocked;
+  }, [developerModeUnlocked]);
+
+  useEffect(() => {
     whisperModelRef.current = whisperModel.trim() || DEFAULT_WHISPER_MODEL;
   }, [whisperModel]);
 
@@ -1573,6 +1669,12 @@ export default function Home() {
   useEffect(() => {
     chatPromptRef.current = resolvePrompt(chatPrompt, DEFAULT_CHAT_PROMPT);
   }, [chatPrompt]);
+
+  useEffect(() => {
+    if (settingsOpen) {
+      void refreshDeveloperModeState();
+    }
+  }, [refreshDeveloperModeState, settingsOpen]);
 
   useEffect(() => {
     if (!settingsOpen) {
@@ -1746,67 +1848,107 @@ export default function Home() {
                 </div>
               </label>
 
-              <label className="settings-field" htmlFor="suggestionContextLines">
-                <span>Live suggestion context window</span>
-                <div className="number-input-wrap">
-                  <input
-                    id="suggestionContextLines"
-                    max={MAX_CONTEXT_LINES}
-                    min={MIN_CONTEXT_LINES}
-                    onChange={(event) => handleSuggestionContextLinesChange(event.target.value)}
-                    step={1}
-                    type="number"
-                    value={suggestionContextLines}
-                  />
-                  <span>lines</span>
-                </div>
-              </label>
+              <div className="developer-mode-panel settings-field-wide">
+                {developerModeUnlocked ? (
+                  <div className="developer-mode-status">
+                    <span>Developer mode unlocked</span>
+                    <button
+                      className="settings-secondary"
+                      disabled={developerModeLoading}
+                      onClick={handleDeveloperModeLock}
+                      type="button"
+                    >
+                      Lock
+                    </button>
+                  </div>
+                ) : (
+                  <form className="developer-mode-form" onSubmit={handleDeveloperModeUnlock}>
+                    <label className="settings-field" htmlFor="developerModePassword">
+                      <span>Developer mode</span>
+                      <div className="developer-mode-unlock-row">
+                        <input
+                          autoComplete="off"
+                          id="developerModePassword"
+                          onChange={(event) => setDeveloperModePassword(event.target.value)}
+                          placeholder="Password"
+                          type="password"
+                          value={developerModePassword}
+                        />
+                        <button className="settings-secondary" disabled={developerModeLoading} type="submit">
+                          {developerModeLoading ? "Unlocking..." : "Unlock"}
+                        </button>
+                      </div>
+                    </label>
+                    {developerModeError ? <div className="settings-error">{developerModeError}</div> : null}
+                  </form>
+                )}
+              </div>
 
-              <label className="settings-field" htmlFor="detailContextLines">
-                <span>Expanded answer context window</span>
-                <div className="number-input-wrap">
-                  <input
-                    id="detailContextLines"
-                    max={MAX_CONTEXT_LINES}
-                    min={MIN_CONTEXT_LINES}
-                    onChange={(event) => handleDetailContextLinesChange(event.target.value)}
-                    step={1}
-                    type="number"
-                    value={detailContextLines}
-                  />
-                  <span>lines</span>
-                </div>
-              </label>
+              {developerModeUnlocked ? (
+                <>
+                  <label className="settings-field" htmlFor="suggestionContextLines">
+                    <span>Live suggestion context window</span>
+                    <div className="number-input-wrap">
+                      <input
+                        id="suggestionContextLines"
+                        max={MAX_CONTEXT_LINES}
+                        min={MIN_CONTEXT_LINES}
+                        onChange={(event) => handleSuggestionContextLinesChange(event.target.value)}
+                        step={1}
+                        type="number"
+                        value={suggestionContextLines}
+                      />
+                      <span>lines</span>
+                    </div>
+                  </label>
 
-              <label className="settings-field settings-field-wide" htmlFor="liveSuggestionPrompt">
-                <span>Live suggestion prompt</span>
-                <textarea
-                  id="liveSuggestionPrompt"
-                  onChange={(event) => setLiveSuggestionPrompt(event.target.value)}
-                  rows={5}
-                  value={liveSuggestionPrompt}
-                />
-              </label>
+                  <label className="settings-field" htmlFor="detailContextLines">
+                    <span>Expanded answer context window</span>
+                    <div className="number-input-wrap">
+                      <input
+                        id="detailContextLines"
+                        max={MAX_CONTEXT_LINES}
+                        min={MIN_CONTEXT_LINES}
+                        onChange={(event) => handleDetailContextLinesChange(event.target.value)}
+                        step={1}
+                        type="number"
+                        value={detailContextLines}
+                      />
+                      <span>lines</span>
+                    </div>
+                  </label>
 
-              <label className="settings-field settings-field-wide" htmlFor="detailAnswerPrompt">
-                <span>Detailed answer prompt</span>
-                <textarea
-                  id="detailAnswerPrompt"
-                  onChange={(event) => setDetailAnswerPrompt(event.target.value)}
-                  rows={5}
-                  value={detailAnswerPrompt}
-                />
-              </label>
+                  <label className="settings-field settings-field-wide" htmlFor="liveSuggestionPrompt">
+                    <span>Live suggestion prompt</span>
+                    <textarea
+                      id="liveSuggestionPrompt"
+                      onChange={(event) => setLiveSuggestionPrompt(event.target.value)}
+                      rows={5}
+                      value={liveSuggestionPrompt}
+                    />
+                  </label>
 
-              <label className="settings-field settings-field-wide" htmlFor="chatPrompt">
-                <span>Chat prompt</span>
-                <textarea
-                  id="chatPrompt"
-                  onChange={(event) => setChatPrompt(event.target.value)}
-                  rows={5}
-                  value={chatPrompt}
-                />
-              </label>
+                  <label className="settings-field settings-field-wide" htmlFor="detailAnswerPrompt">
+                    <span>Detailed answer prompt</span>
+                    <textarea
+                      id="detailAnswerPrompt"
+                      onChange={(event) => setDetailAnswerPrompt(event.target.value)}
+                      rows={5}
+                      value={detailAnswerPrompt}
+                    />
+                  </label>
+
+                  <label className="settings-field settings-field-wide" htmlFor="chatPrompt">
+                    <span>Chat prompt</span>
+                    <textarea
+                      id="chatPrompt"
+                      onChange={(event) => setChatPrompt(event.target.value)}
+                      rows={5}
+                      value={chatPrompt}
+                    />
+                  </label>
+                </>
+              ) : null}
             </div>
 
             <div className="settings-footer">
