@@ -1,6 +1,8 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 const SETTINGS_STORAGE_KEY = "meetmind.settings";
 const LEGACY_GROQ_KEY_STORAGE_KEY = "meetmind.groqApiKey";
@@ -66,6 +68,11 @@ type SuggestionsResponse = {
   error?: string;
 };
 
+type ChatResponse = {
+  answer?: string;
+  error?: string;
+};
+
 type TranscriptionQuality = {
   segmentCount?: number;
   noSpeechProbability?: number | null;
@@ -95,7 +102,7 @@ type StoredSettings = {
   chunkIntervalSeconds?: number;
 };
 
-type ClientLogCategory = "app" | "client" | "audio" | "transcription" | "suggestions" | "groq" | "errors";
+type ClientLogCategory = "app" | "client" | "audio" | "transcription" | "suggestions" | "chat" | "groq" | "errors";
 
 function emitClientLog(category: ClientLogCategory, event: string, data: Record<string, unknown> = {}) {
   if (typeof window === "undefined") {
@@ -130,8 +137,12 @@ function labelFor(type: SuggestionType) {
   }[type];
 }
 
-function simulateAnswer(question: string) {
-  return `Detailed answer to: "${question}"\n\nThis is where a separate, longer-form prompt runs against the chat model with full transcript context. Streamed response ideally. Candidates choose model + prompt strategy — we evaluate quality, latency, relevance.`;
+function FormattedChatText({ text }: { text: string }) {
+  return (
+    <div className="markdown-content">
+      <ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown>
+    </div>
+  );
 }
 
 function transcriptionErrorMessage(error: unknown) {
@@ -413,6 +424,8 @@ export default function Home() {
   const [refreshingTranscript, setRefreshingTranscript] = useState(false);
   const [suggestionsError, setSuggestionsError] = useState<string | null>(null);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
+  const [chatLoading, setChatLoading] = useState(false);
+  const [chatError, setChatError] = useState<string | null>(null);
   const [chatInput, setChatInput] = useState("");
   const [countdown, setCountdown] = useState(DEFAULT_CHUNK_INTERVAL_SECONDS);
 
@@ -438,6 +451,8 @@ export default function Home() {
   const suggestionModelRef = useRef(DEFAULT_SUGGESTION_MODEL);
   const chunkIntervalSecondsRef = useRef(DEFAULT_CHUNK_INTERVAL_SECONDS);
   const transcriptLinesRef = useRef<TranscriptLine[]>([]);
+  const chatMessagesRef = useRef<ChatMessage[]>([]);
+  const chatLoadingRef = useRef(false);
   const suggestionsLoadingRef = useRef(false);
   const refreshingTranscriptRef = useRef(false);
   const manualSegmentFlushResolverRef = useRef<((task?: Promise<void>) => void) | null>(null);
@@ -1051,23 +1066,98 @@ export default function Home() {
 
   const addChatMessage = useCallback((who: ChatMessage["who"], text: string, label?: string) => {
     messageIdRef.current += 1;
-    const id = messageIdRef.current;
+    const message = {
+      id: messageIdRef.current,
+      who,
+      text,
+      label,
+    };
 
-    setChatMessages((current) => [
-      ...current,
-      {
-        id,
-        who,
-        text,
-        label,
-      },
-    ]);
+    setChatMessages((current) => [...current, message]);
+    return message;
   }, []);
 
   const sendToChat = useCallback(
-    (text: string, type?: SuggestionType) => {
-      addChatMessage("user", text, type ? labelFor(type) : undefined);
-      window.setTimeout(() => addChatMessage("ai", simulateAnswer(text)), 600);
+    async (text: string, type?: SuggestionType) => {
+      const question = text.trim();
+
+      if (!question || chatLoadingRef.current) {
+        return;
+      }
+
+      const apiKey = groqApiKeyRef.current;
+
+      if (!apiKey) {
+        setChatError("Open Settings to add your Groq API key before using chat.");
+        emitClientLog("chat", "chat_blocked_missing_api_key");
+        return;
+      }
+
+      const label = type ? labelFor(type) : undefined;
+      const model = suggestionModelRef.current || DEFAULT_SUGGESTION_MODEL;
+      const transcriptContext = transcriptLinesRef.current;
+      const chatHistory = chatMessagesRef.current.slice(-12);
+      const requestedAt = new Date();
+
+      addChatMessage("user", question, label);
+      chatLoadingRef.current = true;
+      setChatLoading(true);
+      setChatError(null);
+
+      emitClientLog("chat", "chat_request_started", {
+        model,
+        suggestionType: type,
+        questionLength: question.length,
+        transcriptLineCount: transcriptContext.length,
+        chatHistoryCount: chatHistory.length,
+      });
+
+      try {
+        const response = await fetch("/api/chat", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-groq-api-key": apiKey,
+          },
+          body: JSON.stringify({
+            model,
+            question,
+            suggestionType: type,
+            transcriptLines: transcriptContext,
+            chatMessages: chatHistory,
+          }),
+        });
+        const payload = (await response.json().catch(() => null)) as ChatResponse | null;
+
+        if (!response.ok) {
+          throw new Error(payload?.error ?? "Chat answer failed.");
+        }
+
+        const answer = payload?.answer?.trim();
+
+        if (!answer) {
+          throw new Error("Chat model returned an empty answer.");
+        }
+
+        addChatMessage("ai", answer);
+        emitClientLog("chat", "chat_response_received", {
+          model,
+          suggestionType: type,
+          durationMs: new Date().getTime() - requestedAt.getTime(),
+          answerLength: answer.length,
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Chat answer failed.";
+        setChatError(message);
+        emitClientLog("errors", "chat_request_failed", {
+          model,
+          suggestionType: type,
+          error: message,
+        });
+      } finally {
+        chatLoadingRef.current = false;
+        setChatLoading(false);
+      }
     },
     [addChatMessage],
   );
@@ -1098,7 +1188,7 @@ export default function Home() {
       return;
     }
 
-    sendToChat(value);
+    void sendToChat(value);
     setChatInput("");
   }, [chatInput, sendToChat]);
 
@@ -1290,6 +1380,7 @@ export default function Home() {
 
   useEffect(() => {
     const chatBody = chatBodyRef.current;
+    chatMessagesRef.current = chatMessages;
 
     if (chatBody) {
       chatBody.scrollTop = chatBody.scrollHeight;
@@ -1537,8 +1628,9 @@ export default function Home() {
                   {batch.suggestions.map((suggestion) => (
                     <button
                       className={`suggestion ${batchPosition === 0 ? "fresh" : "stale"}`}
+                      disabled={chatLoading}
                       key={`${batch.id}-${suggestion.type}-${suggestion.text}`}
-                      onClick={() => sendToChat(suggestion.text, suggestion.type)}
+                      onClick={() => void sendToChat(suggestion.text, suggestion.type)}
                       type="button"
                     >
                       <span className={`sug-tag ${suggestion.type}`}>{labelFor(suggestion.type)}</span>
@@ -1557,31 +1649,43 @@ export default function Home() {
         <div className="col">
           <header>
             <span>3. Chat (detailed answers)</span>
-            <span>session-only</span>
+            <span>{chatLoading ? "thinking" : "session-only"}</span>
           </header>
           <div className="body" id="chatBody" ref={chatBodyRef}>
             <div className="help-banner">
-              Clicking a suggestion adds it to this chat and streams a detailed answer (separate prompt, more
-              context). User can also type questions directly. One continuous chat per session — no login, no
+              Clicking a suggestion adds it to this chat and returns a detailed answer using the full transcript
+              context. User can also type questions directly. One continuous chat per session — no login, no
               persistence.
             </div>
+            {chatError ? <div className="chat-error">{chatError}</div> : null}
             {chatMessages.length === 0 ? (
               <div className="empty" id="chatEmpty">
-                Click a suggestion or type a question below.
+                {chatLoading ? "Generating an answer..." : "Click a suggestion or type a question below."}
               </div>
             ) : (
-              chatMessages.map((message) => (
-                <div className={`chat-msg ${message.who}`} key={message.id}>
-                  <div className="who">
-                    {message.who === "user" ? (message.label ? `You · ${message.label}` : "You") : "Assistant"}
+              <>
+                {chatMessages.map((message) => (
+                  <div className={`chat-msg ${message.who}`} key={message.id}>
+                    <div className="who">
+                      {message.who === "user" ? (message.label ? `You · ${message.label}` : "You") : "Assistant"}
+                    </div>
+                    <div className="bubble">
+                      <FormattedChatText text={message.text} />
+                    </div>
                   </div>
-                  <div className="bubble">{message.text}</div>
-                </div>
-              ))
+                ))}
+                {chatLoading ? (
+                  <div className="chat-msg ai pending">
+                    <div className="who">Assistant</div>
+                    <div className="bubble">Thinking through the transcript...</div>
+                  </div>
+                ) : null}
+              </>
             )}
           </div>
           <div className="chat-input-row">
             <input
+              disabled={chatLoading}
               id="chatInput"
               onChange={(event) => setChatInput(event.target.value)}
               onKeyDown={(event) => {
@@ -1589,11 +1693,11 @@ export default function Home() {
                   handleChatSend();
                 }
               }}
-              placeholder="Ask anything…"
+              placeholder="Ask anything about the conversation..."
               value={chatInput}
             />
-            <button id="chatSend" onClick={handleChatSend} type="button">
-              Send
+            <button disabled={chatLoading} id="chatSend" onClick={handleChatSend} type="button">
+              {chatLoading ? "Thinking..." : "Send"}
             </button>
           </div>
         </div>

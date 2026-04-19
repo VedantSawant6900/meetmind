@@ -11,6 +11,7 @@ export const LOG_GOALS = {
   audio: "Audio chunk metadata, speech gating, and upload shape.",
   transcription: "Transcription request outcomes and accepted transcript text.",
   suggestions: "Live suggestion request context, model output, and UI batch events.",
+  chat: "Detailed answer and direct chat request context and outcomes.",
   groq: "Groq upstream request latency, model, and response status.",
   errors: "Rejected requests, exceptions, and failures needing attention.",
 } as const;
@@ -23,6 +24,7 @@ const LOG_FILES: Record<LogCategory, string> = {
   audio: "audio.jsonl",
   transcription: "transcription.jsonl",
   suggestions: "suggestions.jsonl",
+  chat: "chat.jsonl",
   groq: "groq.jsonl",
   errors: "errors.jsonl",
 };

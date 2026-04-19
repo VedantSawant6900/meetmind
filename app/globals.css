@@ -390,6 +390,11 @@ body {
   transform: translateY(-1px);
 }
 
+.suggestion:disabled {
+  cursor: not-allowed;
+  transform: none;
+}
+
 .suggestion.fresh {
   border-color: var(--accent);
 }
@@ -468,12 +473,108 @@ body {
   border-radius: 8px;
   font-size: 13px;
   line-height: 1.5;
-  white-space: pre-wrap;
+  overflow-x: auto;
 }
 
 .chat-msg.user .bubble {
   background: rgba(110, 168, 254, .08);
   border-color: rgba(110, 168, 254, .3);
+}
+
+.chat-msg.pending .bubble {
+  color: var(--muted);
+}
+
+.markdown-content {
+  overflow-x: auto;
+}
+
+.markdown-content > :first-child {
+  margin-top: 0;
+}
+
+.markdown-content > :last-child {
+  margin-bottom: 0;
+}
+
+.markdown-content p,
+.markdown-content ul,
+.markdown-content ol,
+.markdown-content table,
+.markdown-content pre,
+.markdown-content blockquote {
+  margin: 0 0 10px;
+}
+
+.markdown-content ul,
+.markdown-content ol {
+  padding-left: 20px;
+}
+
+.markdown-content li {
+  margin: 4px 0;
+}
+
+.markdown-content table {
+  width: 100%;
+  min-width: 420px;
+  border-collapse: collapse;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.markdown-content th,
+.markdown-content td {
+  border: 1px solid var(--border);
+  padding: 7px 8px;
+  vertical-align: top;
+}
+
+.markdown-content th {
+  background: rgba(110, 168, 254, .09);
+  color: var(--text);
+  font-weight: 600;
+  text-align: left;
+}
+
+.markdown-content code {
+  background: rgba(255, 255, 255, .08);
+  border: 1px solid rgba(255, 255, 255, .09);
+  border-radius: 4px;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  padding: 1px 4px;
+}
+
+.markdown-content pre {
+  background: #11141a;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow-x: auto;
+  padding: 10px;
+}
+
+.markdown-content pre code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+}
+
+.markdown-content blockquote {
+  border-left: 3px solid var(--accent);
+  color: var(--muted);
+  padding-left: 10px;
+}
+
+.chat-error {
+  color: var(--danger);
+  border: 1px solid rgba(239, 68, 68, .35);
+  background: rgba(239, 68, 68, .08);
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1.45;
+  margin: 0 12px 12px;
+  padding: 8px 10px;
 }
 
 .chat-input-row {
@@ -502,6 +603,12 @@ body {
   cursor: pointer;
   font-size: 13px;
   font-weight: 500;
+}
+
+.chat-input-row input:disabled,
+.chat-input-row button:disabled {
+  cursor: not-allowed;
+  opacity: .65;
 }
 
 .empty {
