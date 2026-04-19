@@ -3,15 +3,25 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import {
+  DEFAULT_CHAT_PROMPT,
+  DEFAULT_DETAIL_ANSWER_PROMPT,
+  DEFAULT_LIVE_SUGGESTION_PROMPT,
+} from "../lib/default-prompts";
 
 const SETTINGS_STORAGE_KEY = "meetmind.settings";
 const LEGACY_GROQ_KEY_STORAGE_KEY = "meetmind.groqApiKey";
 const DEFAULT_WHISPER_MODEL = "whisper-large-v3";
 const DEFAULT_TRANSCRIPTION_LANGUAGE = "en";
 const DEFAULT_SUGGESTION_MODEL = "openai/gpt-oss-120b";
-const DEFAULT_CHUNK_INTERVAL_SECONDS = 10;
+const DEFAULT_CHUNK_INTERVAL_SECONDS = 30;
 const MIN_CHUNK_INTERVAL_SECONDS = 5;
 const MAX_CHUNK_INTERVAL_SECONDS = 120;
+const DEFAULT_SUGGESTION_CONTEXT_LINES = 18;
+const DEFAULT_DETAIL_CONTEXT_LINES = 80;
+const MIN_CONTEXT_LINES = 3;
+const MAX_CONTEXT_LINES = 200;
+const OLDER_CONTEXT_LOOKBACK_LINES = 60;
 const MIN_AUDIO_CHUNK_BYTES = 2_048;
 const MIN_AUDIO_CHUNK_MS = 1_000;
 const AUDIO_ACTIVITY_SAMPLE_MS = 200;
@@ -26,7 +36,6 @@ const VERY_LOW_AVG_LOGPROB = -2;
 const LOW_CONFIDENCE_FRAGMENT_AVG_LOGPROB = -0.85;
 const LOW_CONFIDENCE_FRAGMENT_COMPRESSION_RATIO = 0.35;
 const WEAK_ARTIFACT_NO_SPEECH_PROBABILITY = 0.15;
-const SUGGESTION_CONTEXT_LINE_COUNT = 18;
 
 type SuggestionType = "question" | "talking" | "answer" | "fact" | "clarifying";
 
@@ -47,6 +56,7 @@ type RenderedBatch = {
   id: number;
   batchNumber: number;
   time: string;
+  createdAt: string;
   suggestions: Suggestion[];
 };
 
@@ -54,6 +64,8 @@ type ChatMessage = {
   id: number;
   who: "user" | "ai";
   text: string;
+  time: string;
+  createdAt: string;
   label?: string;
 };
 
@@ -101,6 +113,11 @@ type StoredSettings = {
   transcriptionLanguage?: string;
   suggestionModel?: string;
   chunkIntervalSeconds?: number;
+  suggestionContextLines?: number;
+  detailContextLines?: number;
+  liveSuggestionPrompt?: string;
+  detailAnswerPrompt?: string;
+  chatPrompt?: string;
 };
 
 type ClientLogCategory = "app" | "client" | "audio" | "transcription" | "suggestions" | "chat" | "groq" | "errors";
@@ -228,6 +245,22 @@ function clampChunkInterval(value: number) {
   }
 
   return Math.min(MAX_CHUNK_INTERVAL_SECONDS, Math.max(MIN_CHUNK_INTERVAL_SECONDS, Math.round(value)));
+}
+
+function clampContextLines(value: number, fallback: number) {
+  if (!Number.isFinite(value)) {
+    return fallback;
+  }
+
+  return Math.min(MAX_CONTEXT_LINES, Math.max(MIN_CONTEXT_LINES, Math.round(value)));
+}
+
+function resolvePrompt(value: string, fallback: string) {
+  return value.trim() || fallback;
+}
+
+function getServerTranscriptLineLimit(recentLineLimit: number) {
+  return Math.min(MAX_CONTEXT_LINES, Math.max(recentLineLimit, recentLineLimit + OLDER_CONTEXT_LOOKBACK_LINES));
 }
 
 function parseStoredSettings(value: string | null) {
@@ -419,6 +452,11 @@ export default function Home() {
   const [transcriptionLanguage, setTranscriptionLanguage] = useState(DEFAULT_TRANSCRIPTION_LANGUAGE);
   const [suggestionModel, setSuggestionModel] = useState(DEFAULT_SUGGESTION_MODEL);
   const [chunkIntervalSeconds, setChunkIntervalSeconds] = useState(DEFAULT_CHUNK_INTERVAL_SECONDS);
+  const [suggestionContextLines, setSuggestionContextLines] = useState(DEFAULT_SUGGESTION_CONTEXT_LINES);
+  const [detailContextLines, setDetailContextLines] = useState(DEFAULT_DETAIL_CONTEXT_LINES);
+  const [liveSuggestionPrompt, setLiveSuggestionPrompt] = useState(DEFAULT_LIVE_SUGGESTION_PROMPT);
+  const [detailAnswerPrompt, setDetailAnswerPrompt] = useState(DEFAULT_DETAIL_ANSWER_PROMPT);
+  const [chatPrompt, setChatPrompt] = useState(DEFAULT_CHAT_PROMPT);
   const [transcriptLines, setTranscriptLines] = useState<TranscriptLine[]>([]);
   const [renderedBatches, setRenderedBatches] = useState<RenderedBatch[]>([]);
   const [suggestionsLoading, setSuggestionsLoading] = useState(false);
@@ -445,17 +483,24 @@ export default function Home() {
   const segmentSpeechSamplesRef = useRef(0);
   const segmentTotalSamplesRef = useRef(0);
   const segmentMaxRmsRef = useRef(0);
+  const currentSegmentStartedAtRef = useRef<Date | null>(null);
   const transcriptionQueueRef = useRef<Promise<void>>(Promise.resolve());
   const groqApiKeyRef = useRef("");
   const whisperModelRef = useRef(DEFAULT_WHISPER_MODEL);
   const transcriptionLanguageRef = useRef(DEFAULT_TRANSCRIPTION_LANGUAGE);
   const suggestionModelRef = useRef(DEFAULT_SUGGESTION_MODEL);
   const chunkIntervalSecondsRef = useRef(DEFAULT_CHUNK_INTERVAL_SECONDS);
+  const suggestionContextLinesRef = useRef(DEFAULT_SUGGESTION_CONTEXT_LINES);
+  const detailContextLinesRef = useRef(DEFAULT_DETAIL_CONTEXT_LINES);
+  const liveSuggestionPromptRef = useRef(DEFAULT_LIVE_SUGGESTION_PROMPT);
+  const detailAnswerPromptRef = useRef(DEFAULT_DETAIL_ANSWER_PROMPT);
+  const chatPromptRef = useRef(DEFAULT_CHAT_PROMPT);
   const transcriptLinesRef = useRef<TranscriptLine[]>([]);
   const chatMessagesRef = useRef<ChatMessage[]>([]);
   const chatLoadingRef = useRef(false);
   const suggestionsLoadingRef = useRef(false);
   const refreshingTranscriptRef = useRef(false);
+  const refreshTranscriptThenSuggestionsRef = useRef<((trigger: "auto" | "manual") => Promise<void>) | null>(null);
   const manualSegmentFlushResolverRef = useRef<((task?: Promise<void>) => void) | null>(null);
   const transcriptBodyRef = useRef<HTMLDivElement>(null);
   const chatBodyRef = useRef<HTMLDivElement>(null);
@@ -475,8 +520,11 @@ export default function Home() {
       return;
     }
 
+    const contextLineLimit = suggestionContextLinesRef.current;
+    const serverTranscriptLineLimit = getServerTranscriptLineLimit(contextLineLimit);
+    const prompt = resolvePrompt(liveSuggestionPromptRef.current, DEFAULT_LIVE_SUGGESTION_PROMPT);
     const contextLines = transcriptLinesRef.current
-      .slice(-SUGGESTION_CONTEXT_LINE_COUNT)
+      .slice(-serverTranscriptLineLimit)
       .filter((line) => line.text.trim().length > 0);
 
     if (contextLines.length === 0) {
@@ -496,6 +544,9 @@ export default function Home() {
       trigger,
       model,
       transcriptLineCount: contextLines.length,
+      contextLineLimit,
+      serverTranscriptLineLimit,
+      promptLength: prompt.length,
     });
 
     try {
@@ -507,6 +558,8 @@ export default function Home() {
         },
         body: JSON.stringify({
           model,
+          prompt,
+          contextWindowLines: contextLineLimit,
           transcriptLines: contextLines,
         }),
       });
@@ -531,6 +584,7 @@ export default function Home() {
           id: batchNumber,
           batchNumber,
           time: timestamp(completedAt),
+          createdAt: completedAt.toISOString(),
           suggestions,
         },
         ...current,
@@ -542,6 +596,8 @@ export default function Home() {
         batchNumber,
         suggestionCount: suggestions.length,
         durationMs: completedAt.getTime() - requestedAt.getTime(),
+        contextLineLimit,
+        serverTranscriptLineLimit,
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : "Suggestion generation failed.";
@@ -560,15 +616,13 @@ export default function Home() {
   const tickCountdown = useCallback(() => {
     setCountdown((current) => {
       if (current <= 1) {
-        if (!refreshingTranscriptRef.current) {
-          void generateSuggestionBatch("auto");
-        }
+        void refreshTranscriptThenSuggestionsRef.current?.("auto");
         return chunkIntervalSecondsRef.current;
       }
 
       return current - 1;
     });
-  }, [generateSuggestionBatch]);
+  }, []);
 
   const clearCountdownTimer = useCallback(() => {
     if (countdownTimerRef.current !== null) {
@@ -824,6 +878,7 @@ export default function Home() {
       const startedAt = new Date();
 
       mediaRecorderRef.current = recorder;
+      currentSegmentStartedAtRef.current = startedAt;
       resetSegmentAudioActivity();
 
       emitClientLog("audio", "recorder_segment_started", {
@@ -847,6 +902,7 @@ export default function Home() {
 
         if (mediaRecorderRef.current === recorder) {
           mediaRecorderRef.current = null;
+          currentSegmentStartedAtRef.current = null;
         }
 
         const endedAt = new Date();
@@ -930,11 +986,12 @@ export default function Home() {
     }
 
     mediaRecorderRef.current = null;
+    currentSegmentStartedAtRef.current = null;
     stopAudioActivityMonitor();
     stopMediaStream();
   }, [clearCountdownTimer, clearSegmentTimer, stopAudioActivityMonitor, stopMediaStream]);
 
-  const flushCurrentRecordingSegment = useCallback(async () => {
+  const flushCurrentRecordingSegment = useCallback(async (trigger: "auto" | "manual") => {
     const recorder = mediaRecorderRef.current;
 
     if (!recording || !recorder || recorder.state !== "recording") {
@@ -942,7 +999,15 @@ export default function Home() {
       return;
     }
 
-    emitClientLog("suggestions", "manual_refresh_transcript_flush_started", {
+    const segmentStartedAt = currentSegmentStartedAtRef.current;
+
+    if (trigger === "auto" && segmentStartedAt && Date.now() - segmentStartedAt.getTime() < MIN_AUDIO_CHUNK_MS) {
+      await transcriptionQueueRef.current.catch(() => undefined);
+      return;
+    }
+
+    emitClientLog("suggestions", "refresh_transcript_flush_started", {
+      trigger,
       recorderState: recorder.state,
     });
 
@@ -968,8 +1033,34 @@ export default function Home() {
       }
     });
 
-    emitClientLog("suggestions", "manual_refresh_transcript_flush_completed");
+    emitClientLog("suggestions", "refresh_transcript_flush_completed", { trigger });
   }, [recording]);
+
+  const refreshTranscriptThenSuggestions = useCallback(
+    async (trigger: "auto" | "manual") => {
+      if (refreshingTranscriptRef.current || suggestionsLoadingRef.current) {
+        return;
+      }
+
+      refreshingTranscriptRef.current = true;
+      setRefreshingTranscript(true);
+      setSuggestionsError(null);
+      setCountdown(chunkIntervalSecondsRef.current);
+
+      try {
+        await flushCurrentRecordingSegment(trigger);
+        await generateSuggestionBatch(trigger);
+      } finally {
+        refreshingTranscriptRef.current = false;
+        setRefreshingTranscript(false);
+      }
+    },
+    [flushCurrentRecordingSegment, generateSuggestionBatch],
+  );
+
+  useEffect(() => {
+    refreshTranscriptThenSuggestionsRef.current = refreshTranscriptThenSuggestions;
+  }, [refreshTranscriptThenSuggestions]);
 
   const startRecording = useCallback(async () => {
     if (recording || requestingMic) {
@@ -1035,6 +1126,7 @@ export default function Home() {
     } catch (error) {
       shouldContinueRecordingRef.current = false;
       clearSegmentTimer();
+      currentSegmentStartedAtRef.current = null;
       stopAudioActivityMonitor();
       stopMediaStream();
       setTranscriptionError(microphoneErrorMessage(error));
@@ -1066,11 +1158,15 @@ export default function Home() {
   }, [recording, startRecording, stopRecording]);
 
   const addChatMessage = useCallback((who: ChatMessage["who"], text: string, label?: string) => {
+    const createdAt = new Date();
+
     messageIdRef.current += 1;
     const message = {
       id: messageIdRef.current,
       who,
       text,
+      time: timestamp(createdAt),
+      createdAt: createdAt.toISOString(),
       label,
     };
 
@@ -1096,8 +1192,13 @@ export default function Home() {
 
       const label = type ? labelFor(type) : undefined;
       const model = suggestionModelRef.current || DEFAULT_SUGGESTION_MODEL;
-      const transcriptContext = transcriptLinesRef.current;
+      const transcriptContextLimit = detailContextLinesRef.current;
+      const serverTranscriptLineLimit = getServerTranscriptLineLimit(transcriptContextLimit);
+      const transcriptContext = transcriptLinesRef.current.slice(-serverTranscriptLineLimit);
       const chatHistory = chatMessagesRef.current.slice(-12);
+      const systemPrompt = type
+        ? resolvePrompt(detailAnswerPromptRef.current, DEFAULT_DETAIL_ANSWER_PROMPT)
+        : resolvePrompt(chatPromptRef.current, DEFAULT_CHAT_PROMPT);
       const requestedAt = new Date();
 
       addChatMessage("user", question, label);
@@ -1110,7 +1211,10 @@ export default function Home() {
         suggestionType: type,
         questionLength: question.length,
         transcriptLineCount: transcriptContext.length,
+        contextLineLimit: transcriptContextLimit,
+        serverTranscriptLineLimit,
         chatHistoryCount: chatHistory.length,
+        promptLength: systemPrompt.length,
       });
 
       try {
@@ -1122,6 +1226,8 @@ export default function Home() {
           },
           body: JSON.stringify({
             model,
+            systemPrompt,
+            contextWindowLines: transcriptContextLimit,
             question,
             suggestionType: type,
             transcriptLines: transcriptContext,
@@ -1151,6 +1257,8 @@ export default function Home() {
           suggestionType: type,
           durationMs: new Date().getTime() - requestedAt.getTime(),
           answerLength: answer.length,
+          contextLineLimit: transcriptContextLimit,
+          serverTranscriptLineLimit,
           finishReason: payload?.finishReason ?? null,
         });
       } catch (error) {
@@ -1170,23 +1278,8 @@ export default function Home() {
   );
 
   const handleReload = useCallback(async () => {
-    if (refreshingTranscriptRef.current || suggestionsLoadingRef.current) {
-      return;
-    }
-
-    refreshingTranscriptRef.current = true;
-    setRefreshingTranscript(true);
-    setSuggestionsError(null);
-    setCountdown(chunkIntervalSecondsRef.current);
-
-    try {
-      await flushCurrentRecordingSegment();
-      await generateSuggestionBatch("manual");
-    } finally {
-      refreshingTranscriptRef.current = false;
-      setRefreshingTranscript(false);
-    }
-  }, [flushCurrentRecordingSegment, generateSuggestionBatch]);
+    await refreshTranscriptThenSuggestions("manual");
+  }, [refreshTranscriptThenSuggestions]);
 
   const handleChatSend = useCallback(() => {
     const value = chatInput.trim();
@@ -1219,11 +1312,75 @@ export default function Home() {
     }
   }, [recording]);
 
+  const handleSuggestionContextLinesChange = useCallback((value: string) => {
+    const nextValue = clampContextLines(Number(value), DEFAULT_SUGGESTION_CONTEXT_LINES);
+
+    setSuggestionContextLines(nextValue);
+    emitClientLog("app", "settings_suggestion_context_lines_changed", {
+      suggestionContextLines: nextValue,
+    });
+  }, []);
+
+  const handleDetailContextLinesChange = useCallback((value: string) => {
+    const nextValue = clampContextLines(Number(value), DEFAULT_DETAIL_CONTEXT_LINES);
+
+    setDetailContextLines(nextValue);
+    emitClientLog("app", "settings_detail_context_lines_changed", {
+      detailContextLines: nextValue,
+    });
+  }, []);
+
+  const handleExportSession = useCallback(() => {
+    const exportedAt = new Date();
+    const sessionExport = {
+      exportedAt: exportedAt.toISOString(),
+      settings: {
+        whisperModel: whisperModelRef.current,
+        transcriptionLanguage: transcriptionLanguageRef.current,
+        suggestionModel: suggestionModelRef.current,
+        chunkIntervalSeconds: chunkIntervalSecondsRef.current,
+        suggestionContextLines: suggestionContextLinesRef.current,
+        detailContextLines: detailContextLinesRef.current,
+        prompts: {
+          liveSuggestionPrompt: resolvePrompt(liveSuggestionPromptRef.current, DEFAULT_LIVE_SUGGESTION_PROMPT),
+          detailAnswerPrompt: resolvePrompt(detailAnswerPromptRef.current, DEFAULT_DETAIL_ANSWER_PROMPT),
+          chatPrompt: resolvePrompt(chatPromptRef.current, DEFAULT_CHAT_PROMPT),
+        },
+      },
+      transcript: transcriptLinesRef.current,
+      suggestionBatches: renderedBatches,
+      chatHistory: chatMessagesRef.current,
+    };
+    const blob = new Blob([JSON.stringify(sessionExport, null, 2)], {
+      type: "application/json",
+    });
+    const url = window.URL.createObjectURL(blob);
+    const link = document.createElement("a");
+
+    link.href = url;
+    link.download = `meetmind-session-${exportedAt.toISOString().replace(/[:.]/g, "-")}.json`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.URL.revokeObjectURL(url);
+
+    emitClientLog("app", "session_exported", {
+      transcriptLineCount: transcriptLinesRef.current.length,
+      suggestionBatchCount: renderedBatches.length,
+      chatMessageCount: chatMessagesRef.current.length,
+    });
+  }, [renderedBatches]);
+
   const handleResetDefaults = useCallback(() => {
     setWhisperModel(DEFAULT_WHISPER_MODEL);
     setTranscriptionLanguage(DEFAULT_TRANSCRIPTION_LANGUAGE);
     setSuggestionModel(DEFAULT_SUGGESTION_MODEL);
     setChunkIntervalSeconds(DEFAULT_CHUNK_INTERVAL_SECONDS);
+    setSuggestionContextLines(DEFAULT_SUGGESTION_CONTEXT_LINES);
+    setDetailContextLines(DEFAULT_DETAIL_CONTEXT_LINES);
+    setLiveSuggestionPrompt(DEFAULT_LIVE_SUGGESTION_PROMPT);
+    setDetailAnswerPrompt(DEFAULT_DETAIL_ANSWER_PROMPT);
+    setChatPrompt(DEFAULT_CHAT_PROMPT);
     emitClientLog("app", "settings_reset_defaults");
 
     if (!recording) {
@@ -1317,6 +1474,26 @@ export default function Home() {
       setCountdown(nextInterval);
     }
 
+    if (storedSettings?.suggestionContextLines) {
+      setSuggestionContextLines(clampContextLines(storedSettings.suggestionContextLines, DEFAULT_SUGGESTION_CONTEXT_LINES));
+    }
+
+    if (storedSettings?.detailContextLines) {
+      setDetailContextLines(clampContextLines(storedSettings.detailContextLines, DEFAULT_DETAIL_CONTEXT_LINES));
+    }
+
+    if (storedSettings?.liveSuggestionPrompt) {
+      setLiveSuggestionPrompt(storedSettings.liveSuggestionPrompt);
+    }
+
+    if (storedSettings?.detailAnswerPrompt) {
+      setDetailAnswerPrompt(storedSettings.detailAnswerPrompt);
+    }
+
+    if (storedSettings?.chatPrompt) {
+      setChatPrompt(storedSettings.chatPrompt);
+    }
+
     emitClientLog("app", "app_loaded", {
       restoredSettings: Boolean(storedSettings),
       restoredLegacyKey: Boolean(storedLegacyKey),
@@ -1330,6 +1507,11 @@ export default function Home() {
       transcriptionLanguage,
       suggestionModel,
       chunkIntervalSeconds,
+      suggestionContextLines,
+      detailContextLines,
+      liveSuggestionPrompt,
+      detailAnswerPrompt,
+      chatPrompt,
     };
 
     window.sessionStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settings));
@@ -1339,7 +1521,18 @@ export default function Home() {
     } else {
       window.sessionStorage.removeItem(LEGACY_GROQ_KEY_STORAGE_KEY);
     }
-  }, [chunkIntervalSeconds, groqApiKey, suggestionModel, transcriptionLanguage, whisperModel]);
+  }, [
+    chatPrompt,
+    chunkIntervalSeconds,
+    detailAnswerPrompt,
+    detailContextLines,
+    groqApiKey,
+    liveSuggestionPrompt,
+    suggestionContextLines,
+    suggestionModel,
+    transcriptionLanguage,
+    whisperModel,
+  ]);
 
   useEffect(() => {
     groqApiKeyRef.current = groqApiKey.trim();
@@ -1360,6 +1553,26 @@ export default function Home() {
   useEffect(() => {
     chunkIntervalSecondsRef.current = clampChunkInterval(chunkIntervalSeconds);
   }, [chunkIntervalSeconds]);
+
+  useEffect(() => {
+    suggestionContextLinesRef.current = clampContextLines(suggestionContextLines, DEFAULT_SUGGESTION_CONTEXT_LINES);
+  }, [suggestionContextLines]);
+
+  useEffect(() => {
+    detailContextLinesRef.current = clampContextLines(detailContextLines, DEFAULT_DETAIL_CONTEXT_LINES);
+  }, [detailContextLines]);
+
+  useEffect(() => {
+    liveSuggestionPromptRef.current = resolvePrompt(liveSuggestionPrompt, DEFAULT_LIVE_SUGGESTION_PROMPT);
+  }, [liveSuggestionPrompt]);
+
+  useEffect(() => {
+    detailAnswerPromptRef.current = resolvePrompt(detailAnswerPrompt, DEFAULT_DETAIL_ANSWER_PROMPT);
+  }, [detailAnswerPrompt]);
+
+  useEffect(() => {
+    chatPromptRef.current = resolvePrompt(chatPrompt, DEFAULT_CHAT_PROMPT);
+  }, [chatPrompt]);
 
   useEffect(() => {
     if (!settingsOpen) {
@@ -1431,15 +1644,24 @@ export default function Home() {
 
       mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
       mediaStreamRef.current = null;
+      currentSegmentStartedAtRef.current = null;
     };
   }, []);
 
   return (
     <>
       <div className="topbar">
-        <h1>TwinMind — Live Suggestions Web App (Reference Mockup)</h1>
+        <h1>MeetMind — Live Suggestions</h1>
         <div className="topbar-actions">
           <div className="meta">3-column layout · Transcript · Live Suggestions · Chat</div>
+          <button
+            className="settings-btn"
+            disabled={transcriptLines.length === 0 && renderedBatches.length === 0 && chatMessages.length === 0}
+            onClick={handleExportSession}
+            type="button"
+          >
+            Export
+          </button>
           <button className="settings-btn" onClick={() => setSettingsOpen(true)} type="button">
             Settings
           </button>
@@ -1522,6 +1744,68 @@ export default function Home() {
                   />
                   <span>seconds</span>
                 </div>
+              </label>
+
+              <label className="settings-field" htmlFor="suggestionContextLines">
+                <span>Live suggestion context window</span>
+                <div className="number-input-wrap">
+                  <input
+                    id="suggestionContextLines"
+                    max={MAX_CONTEXT_LINES}
+                    min={MIN_CONTEXT_LINES}
+                    onChange={(event) => handleSuggestionContextLinesChange(event.target.value)}
+                    step={1}
+                    type="number"
+                    value={suggestionContextLines}
+                  />
+                  <span>lines</span>
+                </div>
+              </label>
+
+              <label className="settings-field" htmlFor="detailContextLines">
+                <span>Expanded answer context window</span>
+                <div className="number-input-wrap">
+                  <input
+                    id="detailContextLines"
+                    max={MAX_CONTEXT_LINES}
+                    min={MIN_CONTEXT_LINES}
+                    onChange={(event) => handleDetailContextLinesChange(event.target.value)}
+                    step={1}
+                    type="number"
+                    value={detailContextLines}
+                  />
+                  <span>lines</span>
+                </div>
+              </label>
+
+              <label className="settings-field settings-field-wide" htmlFor="liveSuggestionPrompt">
+                <span>Live suggestion prompt</span>
+                <textarea
+                  id="liveSuggestionPrompt"
+                  onChange={(event) => setLiveSuggestionPrompt(event.target.value)}
+                  rows={5}
+                  value={liveSuggestionPrompt}
+                />
+              </label>
+
+              <label className="settings-field settings-field-wide" htmlFor="detailAnswerPrompt">
+                <span>Detailed answer prompt</span>
+                <textarea
+                  id="detailAnswerPrompt"
+                  onChange={(event) => setDetailAnswerPrompt(event.target.value)}
+                  rows={5}
+                  value={detailAnswerPrompt}
+                />
+              </label>
+
+              <label className="settings-field settings-field-wide" htmlFor="chatPrompt">
+                <span>Chat prompt</span>
+                <textarea
+                  id="chatPrompt"
+                  onChange={(event) => setChatPrompt(event.target.value)}
+                  rows={5}
+                  value={chatPrompt}
+                />
               </label>
             </div>
 
@@ -1613,7 +1897,7 @@ export default function Home() {
           <div className="body" id="suggestionsBody">
             <div className="help-banner">
               On reload (or auto every ~{chunkIntervalSeconds}s), generate <b>3 fresh suggestions</b> from recent transcript
-              context. New batch appears at the top; older batches push down (faded). Each is a tappable
+              context using the latest {suggestionContextLines} lines. New batch appears at the top; older batches push down (faded). Each is a tappable
               card: a <span className="accent-text">question to ask</span>, a{" "}
               <span className="accent-2-text">talking point</span>, an{" "}
               <span className="good-text">answer</span>, a <span className="warn-text">fact-check</span>, or{" "}
@@ -1674,7 +1958,7 @@ export default function Home() {
                 {chatMessages.map((message) => (
                   <div className={`chat-msg ${message.who}`} key={message.id}>
                     <div className="who">
-                      {message.who === "user" ? (message.label ? `You · ${message.label}` : "You") : "Assistant"}
+                      {message.who === "user" ? (message.label ? `You · ${message.label}` : "You") : "Assistant"} · {message.time}
                     </div>
                     <div className="bubble">
                       <FormattedChatText text={message.text} />
