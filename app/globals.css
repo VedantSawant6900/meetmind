@@ -166,6 +166,42 @@ body {
   outline: none;
 }
 
+.developer-mode-panel {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+  background: rgba(255, 255, 255, .025);
+}
+
+.developer-mode-form {
+  display: grid;
+  gap: 8px;
+}
+
+.developer-mode-unlock-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+}
+
+.developer-mode-status {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.developer-mode-status span {
+  color: var(--good);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.settings-error {
+  color: var(--danger);
+  font-size: 12px;
+}
+
 .number-input-wrap {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
