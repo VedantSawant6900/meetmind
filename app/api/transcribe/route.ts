@@ -58,6 +58,14 @@ function getGroqError(body: string) {
   }
 }
 
+function getRequestedLanguage(value: FormDataEntryValue | null) {
+  if (typeof value !== "string" || !value.trim()) {
+    return DEFAULT_TRANSCRIPTION_LANGUAGE;
+  }
+
+  return value.trim();
+}
+
 export async function POST(request: Request) {
   const requestedAt = new Date();
   const apiKey = request.headers.get("x-groq-api-key")?.trim() || process.env.GROQ_API_KEY?.trim();
@@ -86,7 +94,9 @@ export async function POST(request: Request) {
 
   const audio = incomingForm.get("audio");
   const model = incomingForm.get("model");
+  const language = incomingForm.get("language");
   const requestedModel = typeof model === "string" && model.trim() ? model.trim() : DEFAULT_TRANSCRIPTION_MODEL;
+  const requestedLanguage = getRequestedLanguage(language);
 
   if (!(audio instanceof File)) {
     await writeErrorLog({
@@ -123,13 +133,14 @@ export async function POST(request: Request) {
     event: "audio_chunk_received",
     requestedAt: requestedAt.toISOString(),
     model: requestedModel,
+    language: requestedLanguage,
     audio: audioLog,
   });
 
   const groqForm = new FormData();
   groqForm.append("file", audio, audio.name || "meeting-chunk.webm");
   groqForm.append("model", requestedModel);
-  groqForm.append("language", DEFAULT_TRANSCRIPTION_LANGUAGE);
+  groqForm.append("language", requestedLanguage);
   groqForm.append("response_format", "verbose_json");
   groqForm.append("temperature", "0");
 
@@ -137,7 +148,7 @@ export async function POST(request: Request) {
     event: "groq_transcription_request_started",
     requestedAt: requestedAt.toISOString(),
     model: requestedModel,
-    language: DEFAULT_TRANSCRIPTION_LANGUAGE,
+    language: requestedLanguage,
     audio: audioLog,
   });
 
@@ -162,7 +173,7 @@ export async function POST(request: Request) {
       completedAt: completedAt.toISOString(),
       durationMs,
       model: requestedModel,
-      language: DEFAULT_TRANSCRIPTION_LANGUAGE,
+      language: requestedLanguage,
       status: groqResponse.status,
       audio: audioLog,
     });
@@ -173,7 +184,7 @@ export async function POST(request: Request) {
       completedAt: completedAt.toISOString(),
       durationMs,
       model: requestedModel,
-      language: DEFAULT_TRANSCRIPTION_LANGUAGE,
+      language: requestedLanguage,
       status: groqResponse.status,
       audio: audioLog,
       error,
@@ -192,7 +203,7 @@ export async function POST(request: Request) {
     completedAt: completedAt.toISOString(),
     durationMs,
     model: requestedModel,
-    language: DEFAULT_TRANSCRIPTION_LANGUAGE,
+    language: requestedLanguage,
     status: groqResponse.status,
     audio: audioLog,
     textLength: text.length,
@@ -205,7 +216,7 @@ export async function POST(request: Request) {
     completedAt: completedAt.toISOString(),
     durationMs,
     model: requestedModel,
-    language: DEFAULT_TRANSCRIPTION_LANGUAGE,
+    language: requestedLanguage,
     status: groqResponse.status,
     audio: audioLog,
     textLength: text.length,

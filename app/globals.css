@@ -344,10 +344,30 @@ body {
   border-color: var(--accent);
 }
 
+.reload-btn:disabled {
+  cursor: not-allowed;
+  opacity: .65;
+}
+
 .countdown {
   font-size: 11px;
   color: var(--muted);
   margin-left: auto;
+}
+
+.countdown.status-error {
+  color: var(--danger);
+}
+
+.suggestion-error {
+  color: var(--danger);
+  border: 1px solid rgba(239, 68, 68, .35);
+  background: rgba(239, 68, 68, .08);
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1.45;
+  margin: 0 12px 12px;
+  padding: 8px 10px;
 }
 
 .suggestion {
@@ -406,6 +426,11 @@ body {
 .sug-tag.fact {
   background: rgba(251, 191, 36, .15);
   color: var(--warn);
+}
+
+.sug-tag.clarifying {
+  background: rgba(45, 212, 191, .15);
+  color: #5eead4;
 }
 
 .sug-title {
@@ -512,6 +537,10 @@ body {
 
 .warn-text {
   color: var(--warn);
+}
+
+.clarifying-text {
+  color: #5eead4;
 }
 
 .col .body::-webkit-scrollbar {

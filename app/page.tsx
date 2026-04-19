@@ -5,6 +5,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 const SETTINGS_STORAGE_KEY = "meetmind.settings";
 const LEGACY_GROQ_KEY_STORAGE_KEY = "meetmind.groqApiKey";
 const DEFAULT_WHISPER_MODEL = "whisper-large-v3";
+const DEFAULT_TRANSCRIPTION_LANGUAGE = "en";
 const DEFAULT_SUGGESTION_MODEL = "openai/gpt-oss-120b";
 const DEFAULT_CHUNK_INTERVAL_SECONDS = 10;
 const MIN_CHUNK_INTERVAL_SECONDS = 5;
@@ -23,26 +24,14 @@ const VERY_LOW_AVG_LOGPROB = -2;
 const LOW_CONFIDENCE_FRAGMENT_AVG_LOGPROB = -0.85;
 const LOW_CONFIDENCE_FRAGMENT_COMPRESSION_RATIO = 0.35;
 const WEAK_ARTIFACT_NO_SPEECH_PROBABILITY = 0.15;
+const SUGGESTION_CONTEXT_LINE_COUNT = 18;
 
-const suggestionBatches = [
-  [
-    { type: "question", text: "What's your current p99 latency on websocket round-trips?" },
-    { type: "talking", text: "Discord's sharding model: 2,500 guilds per shard, ~150k concurrent users each." },
-    { type: "fact", text: "Fact-check: Slack's 2024 outage was a config push, not capacity — different problem." },
-  ],
-  [
-    { type: "answer", text: "Managed Kafka (MSK) at ~1M events/sec runs roughly $8-15k/mo on AWS." },
-    { type: "question", text: "Have you considered NATS JetStream as a lighter-weight alternative?" },
-    { type: "talking", text: "Sharding by user cohort works if cohorts are stable; bad for viral spikes." },
-  ],
-  [
-    { type: "answer", text: "For state-in-memory issues: Redis Cluster + consistent hashing handles ~1M ops/sec/node." },
-    { type: "fact", text: "Discord publicly serves ~15M concurrent voice users on Elixir/Erlang infra." },
-    { type: "question", text: "What's your read/write ratio? That changes the sharding strategy significantly." },
-  ],
-] as const;
+type SuggestionType = "question" | "talking" | "answer" | "fact" | "clarifying";
 
-type SuggestionType = (typeof suggestionBatches)[number][number]["type"];
+type Suggestion = {
+  type: SuggestionType;
+  text: string;
+};
 
 type TranscriptLine = {
   id: number;
@@ -56,10 +45,7 @@ type RenderedBatch = {
   id: number;
   batchNumber: number;
   time: string;
-  suggestions: readonly {
-    type: SuggestionType;
-    text: string;
-  }[];
+  suggestions: Suggestion[];
 };
 
 type ChatMessage = {
@@ -73,6 +59,11 @@ type TranscriptionResponse = {
   text?: string;
   error?: string;
   quality?: TranscriptionQuality;
+};
+
+type SuggestionsResponse = {
+  suggestions?: Suggestion[];
+  error?: string;
 };
 
 type TranscriptionQuality = {
@@ -99,11 +90,12 @@ type TranscriptFilterContext = {
 type StoredSettings = {
   groqApiKey?: string;
   whisperModel?: string;
+  transcriptionLanguage?: string;
   suggestionModel?: string;
   chunkIntervalSeconds?: number;
 };
 
-type ClientLogCategory = "app" | "client" | "audio" | "transcription" | "groq" | "errors";
+type ClientLogCategory = "app" | "client" | "audio" | "transcription" | "suggestions" | "groq" | "errors";
 
 function emitClientLog(category: ClientLogCategory, event: string, data: Record<string, unknown> = {}) {
   if (typeof window === "undefined") {
@@ -134,6 +126,7 @@ function labelFor(type: SuggestionType) {
     talking: "Talking point",
     answer: "Answer",
     fact: "Fact-check",
+    clarifying: "Clarifying info",
   }[type];
 }
 
@@ -411,10 +404,14 @@ export default function Home() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [groqApiKey, setGroqApiKey] = useState("");
   const [whisperModel, setWhisperModel] = useState(DEFAULT_WHISPER_MODEL);
+  const [transcriptionLanguage, setTranscriptionLanguage] = useState(DEFAULT_TRANSCRIPTION_LANGUAGE);
   const [suggestionModel, setSuggestionModel] = useState(DEFAULT_SUGGESTION_MODEL);
   const [chunkIntervalSeconds, setChunkIntervalSeconds] = useState(DEFAULT_CHUNK_INTERVAL_SECONDS);
   const [transcriptLines, setTranscriptLines] = useState<TranscriptLine[]>([]);
   const [renderedBatches, setRenderedBatches] = useState<RenderedBatch[]>([]);
+  const [suggestionsLoading, setSuggestionsLoading] = useState(false);
+  const [refreshingTranscript, setRefreshingTranscript] = useState(false);
+  const [suggestionsError, setSuggestionsError] = useState<string | null>(null);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [chatInput, setChatInput] = useState("");
   const [countdown, setCountdown] = useState(DEFAULT_CHUNK_INTERVAL_SECONDS);
@@ -437,39 +434,125 @@ export default function Home() {
   const transcriptionQueueRef = useRef<Promise<void>>(Promise.resolve());
   const groqApiKeyRef = useRef("");
   const whisperModelRef = useRef(DEFAULT_WHISPER_MODEL);
+  const transcriptionLanguageRef = useRef(DEFAULT_TRANSCRIPTION_LANGUAGE);
+  const suggestionModelRef = useRef(DEFAULT_SUGGESTION_MODEL);
   const chunkIntervalSecondsRef = useRef(DEFAULT_CHUNK_INTERVAL_SECONDS);
   const transcriptLinesRef = useRef<TranscriptLine[]>([]);
+  const suggestionsLoadingRef = useRef(false);
+  const refreshingTranscriptRef = useRef(false);
+  const manualSegmentFlushResolverRef = useRef<((task?: Promise<void>) => void) | null>(null);
   const transcriptBodyRef = useRef<HTMLDivElement>(null);
   const chatBodyRef = useRef<HTMLDivElement>(null);
 
   const apiKeyReady = groqApiKey.trim().length > 0;
 
-  const addSuggestionBatch = useCallback(() => {
-    const batch = suggestionBatches[batchIndexRef.current % suggestionBatches.length];
-    batchIndexRef.current += 1;
-    const batchNumber = batchIndexRef.current;
+  const generateSuggestionBatch = useCallback(async (trigger: "auto" | "manual") => {
+    if (suggestionsLoadingRef.current) {
+      return;
+    }
 
-    setRenderedBatches((current) => [
-      {
-        id: batchNumber,
+    const apiKey = groqApiKeyRef.current;
+
+    if (!apiKey) {
+      setSuggestionsError("Open Settings to add your Groq API key before generating suggestions.");
+      emitClientLog("suggestions", "suggestions_blocked_missing_api_key", { trigger });
+      return;
+    }
+
+    const contextLines = transcriptLinesRef.current
+      .slice(-SUGGESTION_CONTEXT_LINE_COUNT)
+      .filter((line) => line.text.trim().length > 0);
+
+    if (contextLines.length === 0) {
+      setSuggestionsError("Waiting for transcript text before generating suggestions.");
+      emitClientLog("suggestions", "suggestions_blocked_empty_transcript", { trigger });
+      return;
+    }
+
+    suggestionsLoadingRef.current = true;
+    setSuggestionsLoading(true);
+    setSuggestionsError(null);
+
+    const model = suggestionModelRef.current || DEFAULT_SUGGESTION_MODEL;
+    const requestedAt = new Date();
+
+    emitClientLog("suggestions", "suggestions_request_started", {
+      trigger,
+      model,
+      transcriptLineCount: contextLines.length,
+    });
+
+    try {
+      const response = await fetch("/api/suggestions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-groq-api-key": apiKey,
+        },
+        body: JSON.stringify({
+          model,
+          transcriptLines: contextLines,
+        }),
+      });
+      const payload = (await response.json().catch(() => null)) as SuggestionsResponse | null;
+
+      if (!response.ok) {
+        throw new Error(payload?.error ?? "Suggestion generation failed.");
+      }
+
+      const suggestions = payload?.suggestions ?? [];
+
+      if (suggestions.length !== 3) {
+        throw new Error("Suggestion model did not return exactly 3 suggestions.");
+      }
+
+      batchIndexRef.current += 1;
+      const batchNumber = batchIndexRef.current;
+      const completedAt = new Date();
+
+      setRenderedBatches((current) => [
+        {
+          id: batchNumber,
+          batchNumber,
+          time: timestamp(completedAt),
+          suggestions,
+        },
+        ...current,
+      ]);
+
+      emitClientLog("suggestions", "suggestions_batch_added", {
+        trigger,
+        model,
         batchNumber,
-        time: timestamp(),
-        suggestions: batch,
-      },
-      ...current,
-    ]);
+        suggestionCount: suggestions.length,
+        durationMs: completedAt.getTime() - requestedAt.getTime(),
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Suggestion generation failed.";
+      setSuggestionsError(message);
+      emitClientLog("errors", "suggestions_request_failed", {
+        trigger,
+        model,
+        error: message,
+      });
+    } finally {
+      suggestionsLoadingRef.current = false;
+      setSuggestionsLoading(false);
+    }
   }, []);
 
   const tickCountdown = useCallback(() => {
     setCountdown((current) => {
       if (current <= 1) {
-        addSuggestionBatch();
+        if (!refreshingTranscriptRef.current) {
+          void generateSuggestionBatch("auto");
+        }
         return chunkIntervalSecondsRef.current;
       }
 
       return current - 1;
     });
-  }, [addSuggestionBatch]);
+  }, [generateSuggestionBatch]);
 
   const clearCountdownTimer = useCallback(() => {
     if (countdownTimerRef.current !== null) {
@@ -635,13 +718,16 @@ export default function Home() {
         const mimeType = blob.type || "audio/webm";
         const fileName = `meeting-${startedAt.getTime()}.${extensionForMimeType(mimeType)}`;
         const model = whisperModelRef.current || DEFAULT_WHISPER_MODEL;
+        const language = transcriptionLanguageRef.current || DEFAULT_TRANSCRIPTION_LANGUAGE;
 
         formData.append("audio", blob, fileName);
         formData.append("model", model);
+        formData.append("language", language);
 
         emitClientLog("transcription", "transcription_request_started", {
           fileName,
           model,
+          language,
           audioType: mimeType,
           audioSize: blob.size,
           startedAt: startedAt.toISOString(),
@@ -704,9 +790,12 @@ export default function Home() {
         audioStats,
       });
 
-      transcriptionQueueRef.current = transcriptionQueueRef.current
+      const task = transcriptionQueueRef.current
         .catch(() => undefined)
         .then(() => transcribeAudioChunk(blob, startedAt, endedAt, audioStats));
+
+      transcriptionQueueRef.current = task;
+      return task;
     },
     [transcribeAudioChunk],
   );
@@ -758,9 +847,11 @@ export default function Home() {
           maxRms: Number(segmentMaxRmsRef.current.toFixed(5)),
         };
 
+        let transcriptionTask: Promise<void> | undefined;
+
         if (audioBlob.size >= MIN_AUDIO_CHUNK_BYTES && durationMs >= MIN_AUDIO_CHUNK_MS && hasSpeech) {
           emitClientLog("audio", "audio_chunk_ready", audioStats);
-          enqueueTranscription(audioBlob, startedAt, endedAt, audioStats);
+          transcriptionTask = enqueueTranscription(audioBlob, startedAt, endedAt, audioStats);
         } else {
           emitClientLog("audio", "audio_chunk_skipped", {
             ...audioStats,
@@ -771,6 +862,11 @@ export default function Home() {
                   ? "too_short"
                   : "no_speech_activity",
           });
+        }
+
+        if (manualSegmentFlushResolverRef.current) {
+          manualSegmentFlushResolverRef.current(transcriptionTask);
+          manualSegmentFlushResolverRef.current = null;
         }
 
         if (
@@ -822,6 +918,43 @@ export default function Home() {
     stopMediaStream();
   }, [clearCountdownTimer, clearSegmentTimer, stopAudioActivityMonitor, stopMediaStream]);
 
+  const flushCurrentRecordingSegment = useCallback(async () => {
+    const recorder = mediaRecorderRef.current;
+
+    if (!recording || !recorder || recorder.state !== "recording") {
+      await transcriptionQueueRef.current.catch(() => undefined);
+      return;
+    }
+
+    emitClientLog("suggestions", "manual_refresh_transcript_flush_started", {
+      recorderState: recorder.state,
+    });
+
+    await new Promise<void>((resolve) => {
+      let resolved = false;
+
+      const resolveAfterTask = (task?: Promise<void>) => {
+        if (resolved) {
+          return;
+        }
+
+        resolved = true;
+        void (task ?? transcriptionQueueRef.current).catch(() => undefined).then(resolve);
+      };
+
+      manualSegmentFlushResolverRef.current = resolveAfterTask;
+
+      try {
+        recorder.stop();
+      } catch {
+        manualSegmentFlushResolverRef.current = null;
+        resolveAfterTask();
+      }
+    });
+
+    emitClientLog("suggestions", "manual_refresh_transcript_flush_completed");
+  }, [recording]);
+
   const startRecording = useCallback(async () => {
     if (recording || requestingMic) {
       return;
@@ -852,6 +985,7 @@ export default function Home() {
     emitClientLog("client", "recording_start_requested", {
       chunkIntervalSeconds: chunkIntervalSecondsRef.current,
       whisperModel: whisperModelRef.current,
+      transcriptionLanguage: transcriptionLanguageRef.current,
     });
 
     try {
@@ -938,10 +1072,24 @@ export default function Home() {
     [addChatMessage],
   );
 
-  const handleReload = useCallback(() => {
-    addSuggestionBatch();
+  const handleReload = useCallback(async () => {
+    if (refreshingTranscriptRef.current || suggestionsLoadingRef.current) {
+      return;
+    }
+
+    refreshingTranscriptRef.current = true;
+    setRefreshingTranscript(true);
+    setSuggestionsError(null);
     setCountdown(chunkIntervalSecondsRef.current);
-  }, [addSuggestionBatch]);
+
+    try {
+      await flushCurrentRecordingSegment();
+      await generateSuggestionBatch("manual");
+    } finally {
+      refreshingTranscriptRef.current = false;
+      setRefreshingTranscript(false);
+    }
+  }, [flushCurrentRecordingSegment, generateSuggestionBatch]);
 
   const handleChatSend = useCallback(() => {
     const value = chatInput.trim();
@@ -976,6 +1124,7 @@ export default function Home() {
 
   const handleResetDefaults = useCallback(() => {
     setWhisperModel(DEFAULT_WHISPER_MODEL);
+    setTranscriptionLanguage(DEFAULT_TRANSCRIPTION_LANGUAGE);
     setSuggestionModel(DEFAULT_SUGGESTION_MODEL);
     setChunkIntervalSeconds(DEFAULT_CHUNK_INTERVAL_SECONDS);
     emitClientLog("app", "settings_reset_defaults");
@@ -1057,6 +1206,10 @@ export default function Home() {
       setWhisperModel(storedSettings.whisperModel);
     }
 
+    if (storedSettings?.transcriptionLanguage) {
+      setTranscriptionLanguage(storedSettings.transcriptionLanguage);
+    }
+
     if (storedSettings?.suggestionModel) {
       setSuggestionModel(storedSettings.suggestionModel);
     }
@@ -1077,6 +1230,7 @@ export default function Home() {
     const settings: StoredSettings = {
       groqApiKey,
       whisperModel,
+      transcriptionLanguage,
       suggestionModel,
       chunkIntervalSeconds,
     };
@@ -1088,7 +1242,7 @@ export default function Home() {
     } else {
       window.sessionStorage.removeItem(LEGACY_GROQ_KEY_STORAGE_KEY);
     }
-  }, [chunkIntervalSeconds, groqApiKey, suggestionModel, whisperModel]);
+  }, [chunkIntervalSeconds, groqApiKey, suggestionModel, transcriptionLanguage, whisperModel]);
 
   useEffect(() => {
     groqApiKeyRef.current = groqApiKey.trim();
@@ -1097,6 +1251,14 @@ export default function Home() {
   useEffect(() => {
     whisperModelRef.current = whisperModel.trim() || DEFAULT_WHISPER_MODEL;
   }, [whisperModel]);
+
+  useEffect(() => {
+    transcriptionLanguageRef.current = transcriptionLanguage.trim() || DEFAULT_TRANSCRIPTION_LANGUAGE;
+  }, [transcriptionLanguage]);
+
+  useEffect(() => {
+    suggestionModelRef.current = suggestionModel.trim() || DEFAULT_SUGGESTION_MODEL;
+  }, [suggestionModel]);
 
   useEffect(() => {
     chunkIntervalSecondsRef.current = clampChunkInterval(chunkIntervalSeconds);
@@ -1230,6 +1392,15 @@ export default function Home() {
                 />
               </label>
 
+              <label className="settings-field" htmlFor="transcriptionLanguage">
+                <span>Transcript language</span>
+                <input
+                  id="transcriptionLanguage"
+                  onChange={(event) => setTranscriptionLanguage(event.target.value)}
+                  value={transcriptionLanguage}
+                />
+              </label>
+
               <label className="settings-field" htmlFor="suggestionModel">
                 <span>Suggestion model</span>
                 <input
@@ -1292,7 +1463,8 @@ export default function Home() {
           <div className="body" id="transcriptBody" ref={transcriptBodyRef}>
             <div className="help-banner">
               The transcript scrolls and appends new chunks every ~{chunkIntervalSeconds} seconds while
-              recording. Audio is captured from the mic and transcribed with Groq Whisper Large V3.
+              recording. Audio is captured from the mic and transcribed with Groq Whisper Large V3 using
+              language {transcriptionLanguage || DEFAULT_TRANSCRIPTION_LANGUAGE}.
             </div>
             {transcriptLines.length === 0 ? (
               <div className="empty" id="transcriptEmpty">
@@ -1313,29 +1485,51 @@ export default function Home() {
           <header>
             <span>2. Live Suggestions</span>
             <span id="batchCount">
-              {renderedBatches.length} batch{renderedBatches.length === 1 ? "" : "es"}
+              {refreshingTranscript
+                ? "updating transcript"
+                : suggestionsLoading
+                ? "generating"
+                : `${renderedBatches.length} batch${renderedBatches.length === 1 ? "" : "es"}`}
             </span>
           </header>
           <div className="reload-row">
-            <button className="reload-btn" id="reloadBtn" type="button" onClick={handleReload}>
-              ↻ Reload suggestions
+            <button
+              className="reload-btn"
+              disabled={refreshingTranscript || suggestionsLoading}
+              id="reloadBtn"
+              type="button"
+              onClick={handleReload}
+            >
+              {refreshingTranscript ? "Updating..." : suggestionsLoading ? "Generating..." : "↻ Refresh"}
             </button>
-            <span className="countdown" id="countdown">
-              auto-refresh in {countdown}s
+            <span className={`countdown${suggestionsError ? " status-error" : ""}`} id="countdown">
+              {refreshingTranscript
+                ? "transcribing latest audio"
+                : suggestionsLoading
+                ? "calling Groq"
+                : recording
+                  ? `auto-refresh in ${countdown}s`
+                  : `auto every ~${chunkIntervalSeconds}s while recording`}
             </span>
           </div>
           <div className="body" id="suggestionsBody">
             <div className="help-banner">
-              On reload (or auto every ~30s), generate <b>3 fresh suggestions</b> from recent transcript
+              On reload (or auto every ~{chunkIntervalSeconds}s), generate <b>3 fresh suggestions</b> from recent transcript
               context. New batch appears at the top; older batches push down (faded). Each is a tappable
               card: a <span className="accent-text">question to ask</span>, a{" "}
               <span className="accent-2-text">talking point</span>, an{" "}
-              <span className="good-text">answer</span>, or a <span className="warn-text">fact-check</span>.
+              <span className="good-text">answer</span>, a <span className="warn-text">fact-check</span>, or{" "}
+              <span className="clarifying-text">clarifying info</span>.
               The preview alone should already be useful.
             </div>
+            {suggestionsError ? <div className="suggestion-error">{suggestionsError}</div> : null}
             {renderedBatches.length === 0 ? (
               <div className="empty" id="suggestionsEmpty">
-                Suggestions appear here once recording starts.
+                {refreshingTranscript
+                  ? "Updating transcript before suggestions..."
+                  : suggestionsLoading
+                    ? "Generating suggestions from recent transcript..."
+                    : "Suggestions appear here once transcript text is available."}
               </div>
             ) : (
               renderedBatches.map((batch, batchPosition) => (
