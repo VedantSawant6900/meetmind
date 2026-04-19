@@ -69,6 +69,11 @@ body {
   outline: none;
 }
 
+.settings-btn:disabled {
+  cursor: not-allowed;
+  opacity: .55;
+}
+
 .settings-backdrop {
   position: fixed;
   inset: 0;
@@ -81,12 +86,13 @@ body {
 }
 
 .settings-modal {
-  width: min(480px, 100%);
+  width: min(760px, 100%);
+  max-height: calc(100vh - 36px);
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: 8px;
   box-shadow: 0 24px 70px rgba(0, 0, 0, .42);
-  overflow: hidden;
+  overflow: auto;
 }
 
 .settings-header {
@@ -137,7 +143,8 @@ body {
   font-size: 12px;
 }
 
-.settings-field input {
+.settings-field input,
+.settings-field textarea {
   width: 100%;
   min-width: 0;
   background: var(--panel-2);
@@ -148,7 +155,13 @@ body {
   font-size: 13px;
 }
 
-.settings-field input:focus {
+.settings-field textarea {
+  line-height: 1.45;
+  resize: vertical;
+}
+
+.settings-field input:focus,
+.settings-field textarea:focus {
   border-color: var(--accent);
   outline: none;
 }

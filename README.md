@@ -17,6 +17,8 @@ The app is designed as a three-column workspace:
 - Manual refresh that updates the latest transcript chunk before generating suggestions.
 - Automatic suggestion refresh while recording.
 - Exactly three fresh suggestions per refresh.
+- Export button for the current session transcript, suggestion batches, chat history, and timestamps.
+- Editable prompts and context windows for live suggestions and chat answers.
 - Suggestion categories:
   - Question to ask
   - Talking point
@@ -50,6 +52,7 @@ app/
   globals.css              App styling
   page.tsx                 Main three-column interface
 lib/
+  default-prompts.ts      Shared default prompts
   server-logger.ts         Rotating JSONL logger
 README.md
 package.json
@@ -110,7 +113,12 @@ The top-right **Settings** modal controls the runtime model parameters:
 | Whisper model | `whisper-large-v3` | Audio transcription model. |
 | Transcript language | `en` | Sent to Whisper to prefer English transcription. |
 | Suggestion model | `openai/gpt-oss-120b` | Used for live suggestions and chat answers. |
-| Chunk interval | `10` seconds | How often audio is chunked, transcribed, and used for refresh timing. |
+| Chunk interval | `30` seconds | How often audio is chunked, transcribed, and used for refresh timing. |
+| Live suggestion context window | `18` lines | Number of recent transcript lines used for each suggestion batch. |
+| Expanded answer context window | `80` lines | Number of recent transcript lines used when opening a suggestion or asking chat. |
+| Live suggestion prompt | built-in default | Controls exactly three short, useful suggestion previews. |
+| Detailed answer prompt | built-in default | Controls expanded answers when a suggestion card is clicked. |
+| Chat prompt | built-in default | Controls direct typed questions in the right column. |
 
 Settings are stored in browser session storage, not committed to the repository.
 
@@ -174,7 +182,7 @@ type Suggestion = {
 };
 ```
 
-Manual refresh does two things:
+Manual and automatic refresh both do two things:
 
 1. Flushes the current recording segment if recording is active.
 2. Generates three suggestions from the updated transcript context.
@@ -193,8 +201,19 @@ The request includes:
 - Recent transcript context
 - Recent chat history
 - The configured Groq model
+- The configured prompt for clicked suggestions or direct chat
 
 The answer is rendered as Markdown in the right column.
+
+### 5. Session Export
+
+The **Export** button downloads a JSON file containing:
+
+- Export timestamp
+- Runtime settings and prompts
+- Transcript lines with timestamps
+- Suggestion batches with timestamps
+- Chat history with timestamps
 
 ## Logs
 
@@ -256,7 +275,9 @@ http://localhost:3000
 Whisper model: whisper-large-v3
 Transcript language: en
 Suggestion model: openai/gpt-oss-120b
-Chunk interval: 10
+Chunk interval: 30
+Live suggestion context window: 18
+Expanded answer context window: 80
 ```
 
 7. Paste a Groq API key.
@@ -272,6 +293,8 @@ Chunk interval: 10
 12. Click any suggestion.
 
 13. Confirm the right column adds the suggestion and returns a detailed Markdown-formatted answer.
+
+14. Click **Export** and confirm a JSON file downloads with transcript, suggestion batches, chat history, and timestamps.
 
 ## Useful Commands
 
@@ -307,6 +330,10 @@ Use `http://localhost:3000`, not the network URL, when testing locally. Check br
 - Confirm a Groq API key is available.
 - Check `logs/chat.jsonl`.
 - Check `logs/groq.jsonl` for upstream status codes.
+
+### Groq Rate Limit Reached
+
+The server automatically retries short `429` rate-limit responses from Groq. If rate limits continue after retries, wait briefly, reduce the context windows or prompt length in Settings, or use a higher Groq service tier.
 
 ### Markdown Table Looks Wide
 
