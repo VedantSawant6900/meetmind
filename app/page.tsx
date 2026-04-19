@@ -70,6 +70,7 @@ type SuggestionsResponse = {
 
 type ChatResponse = {
   answer?: string;
+  finishReason?: string | null;
   error?: string;
 };
 
@@ -1140,11 +1141,17 @@ export default function Home() {
         }
 
         addChatMessage("ai", answer);
+
+        if (payload?.finishReason === "length") {
+          setChatError('Answer hit the response length limit. Ask "continue" or narrow the question to finish it.');
+        }
+
         emitClientLog("chat", "chat_response_received", {
           model,
           suggestionType: type,
           durationMs: new Date().getTime() - requestedAt.getTime(),
           answerLength: answer.length,
+          finishReason: payload?.finishReason ?? null,
         });
       } catch (error) {
         const message = error instanceof Error ? error.message : "Chat answer failed.";

@@ -6,6 +6,7 @@ const GROQ_CHAT_COMPLETIONS_URL = "https://api.groq.com/openai/v1/chat/completio
 const DEFAULT_CHAT_MODEL = "openai/gpt-oss-120b";
 const MAX_TRANSCRIPT_CHARS = 12_000;
 const MAX_CHAT_HISTORY_CHARS = 5_000;
+const CHAT_MAX_OUTPUT_TOKENS = 2_500;
 
 type TranscriptLine = {
   time?: string;
@@ -28,6 +29,7 @@ type ChatRequest = {
 
 type GroqChatCompletionResponse = {
   choices?: Array<{
+    finish_reason?: string | null;
     message?: {
       content?: string;
     };
@@ -98,7 +100,7 @@ function buildMessages(question: string, transcriptContext: string, chatHistoryC
     {
       role: "system",
       content:
-        "You are TwinMind, a live meeting copilot. Provide a detailed, useful answer for the right-side chat panel. Ground the answer in the transcript and chat history. If context is thin, say what is missing and give the best next question or framing. Be concise, concrete, and actionable. Use bullets when they improve readability. Do not fabricate facts.",
+        "You are TwinMind, a live meeting copilot. Provide a complete, useful answer for the right-side chat panel. Ground the answer in the transcript and chat history. If context is thin, say what is missing and give the best next question or framing. Be concise, concrete, and actionable. Use bullets or a small table when they improve readability. Keep the answer complete within the response budget; summarize instead of ending mid-step. Do not fabricate facts.",
     },
     {
       role: "user",
@@ -175,7 +177,7 @@ export async function POST(request: Request) {
       model: requestedModel,
       messages: buildMessages(question, transcriptContext, chatHistoryContext, suggestionType),
       temperature: 0.3,
-      max_tokens: 1_000,
+      max_tokens: CHAT_MAX_OUTPUT_TOKENS,
     }),
   });
   const responseBody = await groqResponse.text();
@@ -209,10 +211,14 @@ export async function POST(request: Request) {
   }
 
   let answer = "";
+  let finishReason: string | null = null;
 
   try {
     const completion = JSON.parse(responseBody) as GroqChatCompletionResponse;
-    answer = completion.choices?.[0]?.message?.content?.trim() ?? "";
+    const choice = completion.choices?.[0];
+
+    answer = choice?.message?.content?.trim() ?? "";
+    finishReason = choice?.finish_reason ?? null;
   } catch {
     answer = "";
   }
@@ -238,6 +244,8 @@ export async function POST(request: Request) {
     model: requestedModel,
     status: groqResponse.status,
     answerLength: answer.length,
+    finishReason,
+    maxOutputTokens: CHAT_MAX_OUTPUT_TOKENS,
   });
 
   await writeLog("chat", {
@@ -249,7 +257,9 @@ export async function POST(request: Request) {
     suggestionType,
     questionLength: question.length,
     answerLength: answer.length,
+    finishReason,
+    maxOutputTokens: CHAT_MAX_OUTPUT_TOKENS,
   });
 
-  return Response.json({ answer });
+  return Response.json({ answer, finishReason });
 }
