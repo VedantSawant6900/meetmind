@@ -3,6 +3,7 @@ import { DEFAULT_LIVE_SUGGESTION_PROMPT } from "../../../lib/default-prompts";
 import { fetchGroqWithRetry } from "../../../lib/groq-retry";
 import { buildMeetingContext } from "../../../lib/meeting-context";
 import { parseSuggestions, SUGGESTION_PREVIEW_WORD_LIMIT } from "../../../lib/suggestion-output";
+import { buildFallbackSuggestions } from "../../../lib/suggestion-fallback";
 import { buildSuggestionPlan, type SuggestionPlan, type SuggestionType } from "../../../lib/suggestion-strategy";
 
 export const runtime = "nodejs";
@@ -173,12 +174,101 @@ async function requestSuggestions(apiKey: string, model: string, messages: GroqM
       temperature: 0.2,
       max_tokens: 450,
     }),
+  }, {
+    maxRetries: 1,
   });
 }
 
 function getCompletionContent(responseBody: string) {
   const completion = JSON.parse(responseBody) as GroqChatCompletionResponse;
   return completion.choices?.[0]?.message?.content ?? "";
+}
+
+function shouldUseFallbackForStatus(status: number) {
+  return status === 429 || status >= 500;
+}
+
+function shouldAttemptCorrection(message: string) {
+  return !message.startsWith("Suggestion output failed quality checks:");
+}
+
+async function buildFallbackResponse(options: {
+  requestedAt: Date;
+  requestedModel: string;
+  transcriptLines: TranscriptLine[];
+  transcriptContextLength: number;
+  contextLineCount: number;
+  systemPromptLength: number;
+  meetingContext: ReturnType<typeof buildMeetingContext>;
+  suggestionPlan: SuggestionPlan;
+  fallbackReason: string;
+  correctionUsed: boolean;
+  retryCount: number;
+  retryDelayMs: number;
+  status?: number;
+}) {
+  const {
+    requestedAt,
+    requestedModel,
+    transcriptLines,
+    transcriptContextLength,
+    contextLineCount,
+    systemPromptLength,
+    meetingContext,
+    suggestionPlan,
+    fallbackReason,
+    correctionUsed,
+    retryCount,
+    retryDelayMs,
+    status,
+  } = options;
+  const suggestions = buildFallbackSuggestions(meetingContext.cues, suggestionPlan);
+  const completedAt = new Date();
+  const durationMs = completedAt.getTime() - requestedAt.getTime();
+
+  await writeLog("suggestions", {
+    event: "suggestions_fallback_completed",
+    requestedAt: requestedAt.toISOString(),
+    completedAt: completedAt.toISOString(),
+    durationMs,
+    model: requestedModel,
+    transcriptLineCount: transcriptLines.length,
+    recentLineCount: meetingContext.recentLineCount,
+    olderRelevantLineCount: meetingContext.olderRelevantLineCount,
+    transcriptContextLength,
+    contextWindowLines: contextLineCount,
+    promptLength: systemPromptLength,
+    correctionUsed,
+    retryCount,
+    retryDelayMs,
+    meetingMode: suggestionPlan.meetingMode,
+    meetingModeLabel: suggestionPlan.meetingModeLabel,
+    requiredTypes: suggestionPlan.requiredTypes,
+    planSummary: suggestionPlan.shortSummary,
+    fallbackReason,
+    suggestions,
+  });
+
+  await writeErrorLog({
+    event: "suggestions_fallback_used",
+    requestedAt: requestedAt.toISOString(),
+    completedAt: completedAt.toISOString(),
+    durationMs,
+    model: requestedModel,
+    status,
+    error: fallbackReason,
+    correctionUsed,
+    retryCount,
+    retryDelayMs,
+  });
+
+  return Response.json({
+    suggestions,
+    rationale: suggestionPlan.shortSummary,
+    meetingMode: suggestionPlan.meetingMode,
+    meetingModeLabel: suggestionPlan.meetingModeLabel,
+    selectionPlan: suggestionPlan.slots,
+  });
 }
 
 export async function POST(request: Request) {
@@ -253,7 +343,28 @@ export async function POST(request: Request) {
   });
 
   const userPayload = buildUserPayload(meetingContext, suggestionPlan);
-  let groqResult = await requestSuggestions(apiKey, requestedModel, buildMessages(userPayload, systemPrompt));
+  let groqResult;
+
+  try {
+    groqResult = await requestSuggestions(apiKey, requestedModel, buildMessages(userPayload, systemPrompt));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Suggestion request failed before a response was returned.";
+    return buildFallbackResponse({
+      requestedAt,
+      requestedModel,
+      transcriptLines,
+      transcriptContextLength,
+      contextLineCount,
+      systemPromptLength: systemPrompt.length,
+      meetingContext,
+      suggestionPlan,
+      fallbackReason: message,
+      correctionUsed: false,
+      retryCount: 0,
+      retryDelayMs: 0,
+    });
+  }
+
   let groqResponse = groqResult.response;
   let responseBody = groqResult.body;
   let correctionUsed = false;
@@ -289,6 +400,24 @@ export async function POST(request: Request) {
       retryDelayMs: transportRetryDelayMs,
     });
 
+    if (shouldUseFallbackForStatus(groqResponse.status)) {
+      return buildFallbackResponse({
+        requestedAt,
+        requestedModel,
+        transcriptLines,
+        transcriptContextLength,
+        contextLineCount,
+        systemPromptLength: systemPrompt.length,
+        meetingContext,
+        suggestionPlan,
+        fallbackReason: error,
+        correctionUsed,
+        retryCount: transportRetryCount,
+        retryDelayMs: transportRetryDelayMs,
+        status: groqResponse.status,
+      });
+    }
+
     return jsonError(error, groqResponse.status);
   }
 
@@ -311,11 +440,51 @@ export async function POST(request: Request) {
       responseLength: responseBody.length,
     });
 
-    groqResult = await requestSuggestions(
-      apiKey,
-      requestedModel,
-      buildCorrectionMessages(userPayload, systemPrompt, rawContent, message, suggestionPlan),
-    );
+    if (!shouldAttemptCorrection(message)) {
+      return buildFallbackResponse({
+        requestedAt,
+        requestedModel,
+        transcriptLines,
+        transcriptContextLength,
+        contextLineCount,
+        systemPromptLength: systemPrompt.length,
+        meetingContext,
+        suggestionPlan,
+        fallbackReason: message,
+        correctionUsed,
+        retryCount: transportRetryCount,
+        retryDelayMs: transportRetryDelayMs,
+      });
+    }
+
+    try {
+      groqResult = await requestSuggestions(
+        apiKey,
+        requestedModel,
+        buildCorrectionMessages(userPayload, systemPrompt, rawContent, message, suggestionPlan),
+      );
+    } catch (correctionTransportError) {
+      const correctionTransportMessage =
+        correctionTransportError instanceof Error
+          ? correctionTransportError.message
+          : "Suggestion correction request failed before a response was returned.";
+
+      return buildFallbackResponse({
+        requestedAt,
+        requestedModel,
+        transcriptLines,
+        transcriptContextLength,
+        contextLineCount,
+        systemPromptLength: systemPrompt.length,
+        meetingContext,
+        suggestionPlan,
+        fallbackReason: correctionTransportMessage,
+        correctionUsed: true,
+        retryCount: transportRetryCount,
+        retryDelayMs: transportRetryDelayMs,
+      });
+    }
+
     groqResponse = groqResult.response;
     responseBody = groqResult.body;
     correctionUsed = true;
@@ -351,6 +520,24 @@ export async function POST(request: Request) {
         retryDelayMs: transportRetryDelayMs,
       });
 
+      if (shouldUseFallbackForStatus(groqResponse.status)) {
+        return buildFallbackResponse({
+          requestedAt,
+          requestedModel,
+          transcriptLines,
+          transcriptContextLength,
+          contextLineCount,
+          systemPromptLength: systemPrompt.length,
+          meetingContext,
+          suggestionPlan,
+          fallbackReason: groqError,
+          correctionUsed,
+          retryCount: transportRetryCount,
+          retryDelayMs: transportRetryDelayMs,
+          status: groqResponse.status,
+        });
+      }
+
       return jsonError(groqError, groqResponse.status);
     }
 
@@ -376,7 +563,21 @@ export async function POST(request: Request) {
         correctionUsed,
       });
 
-      return jsonError(correctionMessage, 502);
+      return buildFallbackResponse({
+        requestedAt,
+        requestedModel,
+        transcriptLines,
+        transcriptContextLength,
+        contextLineCount,
+        systemPromptLength: systemPrompt.length,
+        meetingContext,
+        suggestionPlan,
+        fallbackReason: correctionMessage,
+        correctionUsed,
+        retryCount: transportRetryCount,
+        retryDelayMs: transportRetryDelayMs,
+        status: 502,
+      });
     }
   }
 

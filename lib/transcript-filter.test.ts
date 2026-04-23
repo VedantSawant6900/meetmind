@@ -66,4 +66,28 @@ describe("transcript-filter", () => {
 
     expect(reason).toBe("low_information_weak_signal");
   });
+
+  it("drops silent hallucinations like a lone word when no-speech confidence is high", () => {
+    const reason = getTranscriptFilterReason(
+      "you",
+      [],
+      {
+        audioStats: {
+          audioType: "audio/wav",
+          audioSize: 32_000,
+          durationMs: 1_000,
+          speechSamples: 0,
+          totalSamples: 12,
+          maxRms: 0.01,
+        },
+        quality: {
+          noSpeechProbability: 0.7,
+          avgLogprob: -0.7,
+          maxCompressionRatio: 0.27,
+        },
+      },
+    );
+
+    expect(reason).toBe("low_information_weak_signal");
+  });
 });
