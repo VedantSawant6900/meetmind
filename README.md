@@ -1,363 +1,263 @@
 # MeetMind
 
-MeetMind is a browser-based live meeting copilot. It listens to microphone audio, transcribes the conversation in short chunks, generates useful live suggestions from recent context, and lets the user open a detailed chat answer from any suggestion.
+MeetMind is a TwinMind-style live meeting copilot built for the live suggestions assignment. It records microphone audio, transcribes it with Groq Whisper Large V3, surfaces exactly 3 useful live suggestions every refresh, and expands clicked suggestions into meeting-ready answers in a persistent session chat.
 
-The app is designed as a three-column workspace:
+The product shape stays intentionally simple:
 
-- **Mic & Transcript**: captures live audio from the microphone and appends transcript chunks.
-- **Live Suggestions**: produces exactly three context-aware suggestions from the latest transcript.
-- **Chat Answers**: expands clicked suggestions or typed questions into detailed answers grounded in the transcript.
+- Left: microphone + rolling transcript
+- Middle: exactly 3 live suggestions per batch
+- Right: detailed answers for clicked suggestions or typed questions
 
-## Features
+## What Improved
 
-- Live microphone recording with start and stop controls.
-- Chunked transcription through Groq Whisper Large V3.
-- Configurable transcript language, defaulting to English (`en`) to reduce non-English hallucinations from music, silence, and notification sounds.
-- Transcript quality filtering using audio activity and Whisper segment confidence signals.
-- Manual refresh that updates the latest transcript chunk before generating suggestions.
-- Automatic suggestion refresh while recording.
-- Exactly three fresh suggestions per refresh.
-- Export button for the current session transcript, suggestion batches, chat history, and timestamps.
-- Editable prompts and context windows for live suggestions and chat answers.
-- Suggestion categories:
-  - Question to ask
-  - Talking point
-  - Answer
-  - Fact-check
-  - Clarifying info
-- Right-side chat powered by Groq GPT-OSS 120B.
-- Markdown rendering for chat answers, including tables, lists, bold text, and inline code.
-- Session-only state. Reloading the page clears transcript, suggestions, and chat.
-- Local structured logs with rotation for debugging.
+This version is tuned around the assignment priorities instead of adding extra product surface area.
+
+- Live suggestions are more opinionated about the next 30-90 seconds of the meeting.
+- Suggestion selection is cue-aware instead of generic: unresolved questions, blockers, decisions, claims, dates, and terminology drive the mix.
+- Clicked answers are structured to help the user say, ask, verify, or explain something immediately.
+- The middle column now shows meeting mode, why the batch was chosen, and clearer freshness/loading states.
+- The client works with either a pasted API key or a server-side `GROQ_API_KEY`, without exposing secrets.
+- The oversized page was split into reusable UI components plus extracted hooks and shared logic modules.
+- Core logic now has lightweight tests.
+
+## Core Behavior
+
+- Groq for everything
+- Whisper Large V3 for transcription
+- `openai/gpt-oss-120b` as the default suggestion and chat model
+- Exactly 3 suggestions per refresh
+- Session-only UX, no login, no persistence after reload
+- Export transcript + suggestion batches + chat history with timestamps
 
 ## Tech Stack
 
-- **Framework**: Next.js App Router
-- **Language**: TypeScript
-- **UI**: React
-- **Transcription**: Groq Whisper Large V3
-- **Suggestions and chat**: Groq GPT-OSS 120B
-- **Markdown rendering**: `react-markdown` with `remark-gfm`
-- **Logging**: local JSON Lines files in `logs/`
+- Next.js App Router
+- React + TypeScript
+- Groq APIs
+- `react-markdown` + `remark-gfm`
+- `vitest` for focused logic tests
 
 ## Project Structure
 
 ```txt
 app/
   api/
-    chat/route.ts          Detailed chat answers
-    developer-mode/route.ts Settings unlock for prompt/context controls
-    logs/route.ts          Browser-to-server log ingestion
-    suggestions/route.ts   Live suggestion generation
-    transcribe/route.ts    Audio transcription
-  globals.css              App styling
-  page.tsx                 Main three-column interface
+    chat/route.ts
+    config/route.ts
+    logs/route.ts
+    suggestions/route.ts
+    transcribe/route.ts
+  globals.css
+  page.tsx
+components/
+  ChatPanel.tsx
+  FormattedChatText.tsx
+  SettingsModal.tsx
+  SuggestionsPanel.tsx
+  TopBar.tsx
+  TranscriptPanel.tsx
+hooks/
+  useCurrentTime.ts
+  useServerGroqKey.ts
 lib/
-  default-prompts.ts      Shared default prompts
-  groq-retry.ts          Groq retry helper
-  meeting-context.ts     Transcript cue extraction and relevance selection
-  server-logger.ts         Rotating JSONL logger
-README.md
-package.json
+  audio-client.ts
+  client-config.ts
+  client-formatters.ts
+  client-logger.ts
+  client-types.ts
+  default-prompts.ts
+  groq-retry.ts
+  meeting-context.ts
+  server-logger.ts
+  suggestion-output.ts
+  suggestion-strategy.ts
+  transcript-filter.ts
 ```
 
-## Requirements
+## Running Locally
+
+### Requirements
 
 - Node.js 22.13+ recommended
 - npm 10+
-- A Groq API key
-- A browser that supports `MediaRecorder`
+- Browser with `MediaRecorder`
 - Microphone access enabled
 
-Microphone capture requires a secure browser context. Localhost works:
-
-```bash
-http://localhost:3000
-```
-
-## Quick Start
-
-1. Clone the repository:
-
-```bash
-git clone git@github.com:VedantSawant6900/meetmind.git
-cd meetmind
-```
-
-2. Install dependencies:
+### Install
 
 ```bash
 npm install
 ```
 
-3. Start the development server:
+### Start
 
 ```bash
 npm run dev
 ```
 
-4. Open the app:
-
-```txt
-http://localhost:3000
-```
-
-5. Open **Settings** and paste your Groq API key.
-
-6. Click the microphone button and start speaking.
-
-## Settings
-
-The top-right **Settings** modal always shows the Groq API key. Runtime model and prompt controls are restricted to admin mode:
-
-| Setting | Default | Purpose |
-| --- | --- | --- |
-| Groq API key | empty | Used by API routes to call Groq. |
-| Admin mode | `1234` demo password | Unlocks runtime model, prompt, and context-window editing. |
-| Whisper model | `whisper-large-v3` | Admin-mode control for the audio transcription model. |
-| Transcript language | `en` | Admin-mode control sent to Whisper to prefer English transcription. |
-| Suggestion model | `openai/gpt-oss-120b` | Admin-mode control used for live suggestions and chat answers. |
-| Chunk interval | `30` seconds | Admin-mode control for how often audio is chunked, transcribed, and used for refresh timing. |
-| Live suggestion context window | `18` lines | Admin-mode control for each suggestion batch. |
-| Expanded answer context window | `80` lines | Admin-mode control for clicked suggestions and typed chat. |
-| Live suggestion prompt | built-in default | Admin-mode control for three short suggestion previews. |
-| Detailed answer prompt | built-in default | Admin-mode control for expanded clicked-suggestion answers. |
-| Chat prompt | built-in default | Admin-mode control for direct typed questions. |
-
-Settings are stored in browser session storage, not committed to the repository.
+Open `http://localhost:3000`.
 
 ## Environment Variables
 
-The app can use the API key from either the browser Settings modal or an environment variable.
+The app supports two valid key modes:
 
-Create `.env.local` if you want a local fallback key:
+1. User pastes a Groq key in Settings
+2. Server already has `GROQ_API_KEY`
+
+Create `.env.local` for server-side fallback:
 
 ```bash
 GROQ_API_KEY=your_groq_key_here
 ```
 
-Admin mode checks the password on the server. The committed demo fallback unlocks with `1234`; for any real deployment, override it with a SHA-256 password hash:
+## Settings
 
-```bash
-DEVELOPER_MODE_PASSWORD_HASH=your_sha256_hex_hash_here
-```
+The Settings modal keeps the assignment-required runtime tuning directly editable:
 
-Generate a hash locally with:
+- Whisper model
+- Transcript language
+- Suggestion model
+- Chunk interval
+- Live suggestion context window
+- Expanded answer context window
+- Live suggestion prompt
+- Detailed answer prompt
+- Chat prompt
 
-```bash
-node -e "const crypto=require('crypto'); console.log(crypto.createHash('sha256').update(process.argv[1]).digest('hex'))" "your-password"
-```
+Settings are stored in browser session storage only.
 
-`.env.local` is ignored by git.
+## Prompt Strategy
 
-## How The App Works
+### Live Suggestions
 
-### 1. Audio Capture
+The live suggestion prompt is intentionally opinionated.
 
-The browser records microphone input with `MediaRecorder`. Audio is split into short segments based on the chunk interval.
+- Optimize for what helps in the next speaking turn, not recap.
+- Force diversity across the 3 cards.
+- Prefer transcript nouns, owners, dates, numbers, blockers, and dependencies.
+- Reject bland suggestions like “ask for clarification” unless grounded in a specific topic.
+- Follow a cue-driven slot plan when one is available.
 
-Before uploading, the client samples audio RMS activity. Segments that are too small, too short, or likely silent are skipped.
+### Clicked Suggestion Answers
 
-### 2. Transcription
+Clicked answers are shaped by suggestion type:
 
-Audio chunks are sent to:
+- `question`: polished line to say, why now, optional follow-up
+- `talking`: 2-4 concise spoken bullets
+- `answer`: most likely answer first, then evidence and assumptions
+- `fact`: supported by transcript vs needs verification
+- `clarifying`: plain-English explanation tied to the live topic
 
-```txt
-POST /api/transcribe
-```
+### Typed Chat
 
-The route forwards the file to Groq Whisper with:
+Typed chat stays grounded in transcript + recent chat, with concise sections and explicit uncertainty when information is missing.
 
-- `model`
-- `language`
-- `response_format=verbose_json`
-- `temperature=0`
+## Context Strategy
 
-The verbose response provides confidence signals such as:
+The app does not just send the latest raw transcript dump.
 
-- `avg_logprob`
-- `compression_ratio`
-- `no_speech_prob`
+- Recent transcript is clipped to a focused live window.
+- Older transcript is selected by relevance, not by simple recency.
+- Meeting cues are extracted from recent lines:
+  explicit questions, open questions, decisions, blockers, action items, verification candidates, clarification terms, uncertainty phrases, and meeting mode.
+- Suggestion planning uses those cues to bias the 3-card mix.
+- Payload sizes were kept tighter to improve latency without dropping the freshest signal.
 
-The client uses those signals with browser audio stats to filter weak hallucinated fragments.
+## Why The Suggestions Are Better
 
-### 3. Live Suggestions
+The biggest scoring category is live suggestion quality, so the backend now does more than “ask the model for 3 ideas”.
 
-Suggestions are generated through:
+- Cue extraction is cleaner and less noisy.
+- A suggestion plan decides which jobs should be represented in the batch.
+- Validation is stricter around generic or duplicate cards.
+- The correction pass still exists if the model returns malformed output.
+- The UI explains why the fresh batch exists, which improves trust during a live meeting.
 
-```txt
-POST /api/suggestions
-```
+## UI / UX Notes
 
-The request includes recent transcript lines and the configured suggestion model. The server asks Groq to return exactly three suggestions as JSON. Each suggestion contains:
+- Manual and automatic refresh both flush the active recording segment before suggestions are generated.
+- Suggestion batches show detected meeting mode and a short “why these suggestions” line.
+- The newest batch is visually primary; older batches stay visible but secondary.
+- Chat no longer feels frozen when an answer is in flight: the user can queue the next click or typed question.
+- The layout remains three-column on desktop and collapses cleanly on narrower screens.
 
-```ts
-type Suggestion = {
-  type: "question" | "talking" | "answer" | "fact" | "clarifying";
-  text: string;
-};
-```
+## Testing And Validation
 
-Manual and automatic refresh both do two things:
-
-1. Flushes the current recording segment if recording is active.
-2. Generates three suggestions from the updated transcript context.
-
-### 4. Chat Answers
-
-Chat answers are generated through:
-
-```txt
-POST /api/chat
-```
-
-The request includes:
-
-- The clicked suggestion or typed user question
-- Recent transcript context
-- Recent chat history
-- The configured Groq model
-- The configured prompt for clicked suggestions or direct chat
-
-The answer is rendered as Markdown in the right column.
-
-### 5. Session Export
-
-The **Export** button downloads a JSON file containing:
-
-- Export timestamp
-- Runtime settings and prompts
-- Transcript lines with timestamps
-- Suggestion batches with timestamps
-- Chat history with timestamps
-
-## Logs
-
-The app writes local logs to `logs/`. This folder is ignored by git.
-
-Log files:
-
-| File | Purpose |
-| --- | --- |
-| `app.jsonl` | App lifecycle and Settings events |
-| `client.jsonl` | Browser UI and recorder state |
-| `audio.jsonl` | Audio chunk metadata and speech gating |
-| `transcription.jsonl` | Transcription request and transcript filter outcomes |
-| `suggestions.jsonl` | Live suggestion request and response details |
-| `chat.jsonl` | Detailed answer and direct chat request details |
-| `groq.jsonl` | Groq request status and latency |
-| `errors.jsonl` | Rejections, exceptions, and failures |
-
-Each log file rotates up to 10 files. Default max size is 512 KB per file. Override it with:
-
-```bash
-LOG_MAX_BYTES=1048576 npm run dev
-```
-
-## Replication Steps
-
-Use this flow to reproduce the current app behavior from a fresh checkout:
-
-1. Install dependencies:
-
-```bash
-npm install
-```
-
-2. Run validation:
+### Commands
 
 ```bash
 npm run typecheck
+npm run test
 npm run build
 ```
 
-3. Start the app:
+### Current Test Coverage
 
-```bash
-npm run dev
-```
+Focused unit tests cover:
 
-4. Open:
+- suggestion parsing and validation
+- duplicate/generic suggestion rejection
+- meeting cue extraction and context selection
+- suggestion planning
+- transcript filtering
 
-```txt
-http://localhost:3000
-```
+## Logging
 
-5. Open **Settings**.
+The app writes local JSONL logs to `logs/`:
 
-6. Enter:
+- `app.jsonl`
+- `client.jsonl`
+- `audio.jsonl`
+- `transcription.jsonl`
+- `suggestions.jsonl`
+- `chat.jsonl`
+- `groq.jsonl`
+- `errors.jsonl`
 
-```txt
-Whisper model: whisper-large-v3
-Transcript language: en
-Suggestion model: openai/gpt-oss-120b
-Chunk interval: 30
-Developer mode password: 1234
-Live suggestion context window: 18
-Expanded answer context window: 80
-```
-
-7. Paste a Groq API key.
-
-8. Click the mic button and speak for at least one chunk interval.
-
-9. Confirm the left column appends transcript text.
-
-10. Click **Refresh** in the middle column.
-
-11. Confirm exactly three suggestions appear at the top.
-
-12. Click any suggestion.
-
-13. Confirm the right column adds the suggestion and returns a detailed Markdown-formatted answer.
-
-14. Click **Export** and confirm a JSON file downloads with transcript, suggestion batches, chat history, and timestamps.
+These help inspect latency, transcript filtering, Groq failures, and suggestion generation behavior during live use.
 
 ## Useful Commands
 
 ```bash
-npm run dev        # Start local development server
-npm run typecheck  # Run TypeScript checks
-npm run build      # Build production bundle
+npm run dev
+npm run typecheck
+npm run test
+npm run build
 ```
 
 ## Troubleshooting
 
-### Microphone Permission Denied
+### No Transcript
 
-Use `http://localhost:3000`, not the network URL, when testing locally. Check browser site permissions and system microphone privacy settings.
+- Confirm microphone permissions
+- Confirm a pasted key or server-side `GROQ_API_KEY`
+- Speak long enough to produce a chunk
+- Check `logs/transcription.jsonl` and `logs/errors.jsonl`
 
-### No Transcript Appears
+### No Suggestions
 
-- Confirm the Groq API key is present in Settings.
-- Confirm the browser has mic access.
-- Speak for longer than the chunk interval.
-- Check `logs/audio.jsonl` for skipped chunks.
-- Check `logs/errors.jsonl` for API errors.
+- Confirm transcript lines exist first
+- Click Refresh manually
+- Check `logs/suggestions.jsonl`
+- Keep the suggestion model on `openai/gpt-oss-120b`
 
-### Suggestions Do Not Appear
+### No Chat Answer
 
-- Confirm transcript lines exist first.
-- Click **Refresh** manually.
-- Check `logs/suggestions.jsonl`.
-- Check that the suggestion model is `openai/gpt-oss-120b`.
+- Confirm key availability
+- Check `logs/chat.jsonl` and `logs/groq.jsonl`
 
-### Chat Does Not Answer
+### Rate Limits
 
-- Confirm a Groq API key is available.
-- Check `logs/chat.jsonl`.
-- Check `logs/groq.jsonl` for upstream status codes.
+Groq calls already retry short `429` responses. If limits persist, reduce prompt/context size or wait briefly.
 
-### Groq Rate Limit Reached
+## Tradeoffs
 
-The server automatically retries short `429` rate-limit responses from Groq. If rate limits continue after retries, wait briefly, reduce the context windows or prompt length in Settings, or use a higher Groq service tier.
-
-### Markdown Table Looks Wide
-
-Tables inside chat answers scroll horizontally inside the bubble so the layout remains stable.
+- I prioritized better cue selection, clearer answer structure, and faster perceived feedback over adding new product surface area.
+- Tests focus on logic that changes assignment quality, not UI snapshots.
+- The page is smaller and cleaner than before, but the audio/recording controller still lives in `app/page.tsx`; that is the next refactor if more time is available.
 
 ## Security Notes
 
-- Do not commit API keys.
-- `grok_api.txt`, `.env.local`, and `logs/` are ignored.
-- If a key is accidentally pasted into chat, screenshots, or a tracked file, revoke it and create a new one.
+- Do not commit API keys
+- `.env.local`, `grok_api.txt`, `logs/`, and the local detailed documentation file are ignored by git
+- If a key is accidentally exposed, revoke it and create a new one

@@ -109,7 +109,8 @@ const DECISION_PATTERN =
 const BLOCKER_PATTERN =
   /\b(?:blocker|blocked|risk|concern|issue|problem|dependency|depends on|waiting on|delay|delayed|behind|can't|cannot|unable|stuck|missing)\b/i;
 const ACTION_PATTERN =
-  /\b(?:action item|next step|follow up|follow-up|owner|owns|assign|by (?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)|i'll|i will|we'll|we will|let's|can you|could you|we need to)\b/i;
+  /\b(?:action item|next step|follow up|follow-up|owner|owns|assign|by (?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)|i'll|i will|we'll|we will|let's|can you|could you)\b/i;
+const SOFT_ACTION_PATTERN = /\bwe need to\b/i;
 const NUMBER_PATTERN = /\b(?:\$?\d+(?:[.,]\d+)*(?:\.\d+)?%?|q[1-4]|fy\d{2,4})\b/i;
 const DATE_PATTERN =
   /\b(?:today|tomorrow|yesterday|monday|tuesday|wednesday|thursday|friday|saturday|sunday|jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?|\d{1,2}\/\d{1,2}(?:\/\d{2,4})?)\b/i;
@@ -285,11 +286,19 @@ export function extractMeetingCues(lines: TranscriptLine[]): MeetingCues {
       addUnique(blockers, cueSnippet(line));
     }
 
-    if (ACTION_PATTERN.test(line.text)) {
+    if (
+      ACTION_PATTERN.test(line.text) ||
+      (SOFT_ACTION_PATTERN.test(line.text) && !DECISION_PATTERN.test(line.text) && !OPEN_QUESTION_PATTERN.test(line.text))
+    ) {
       addUnique(actionItems, cueSnippet(line));
     }
 
-    if (NUMBER_PATTERN.test(line.text) || DATE_PATTERN.test(line.text) || CLAIM_PATTERN.test(line.text)) {
+    const hasVerificationSignal =
+      NUMBER_PATTERN.test(line.text) ||
+      CLAIM_PATTERN.test(line.text) ||
+      (DATE_PATTERN.test(line.text) && !QUESTION_START_PATTERN.test(line.text) && !line.text.includes("?"));
+
+    if (hasVerificationSignal) {
       addUnique(verificationCandidates, cueSnippet(line));
     }
   });

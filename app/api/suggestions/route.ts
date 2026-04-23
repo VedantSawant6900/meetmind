@@ -2,6 +2,8 @@ import { writeErrorLog, writeLog } from "../../../lib/server-logger";
 import { DEFAULT_LIVE_SUGGESTION_PROMPT } from "../../../lib/default-prompts";
 import { fetchGroqWithRetry } from "../../../lib/groq-retry";
 import { buildMeetingContext } from "../../../lib/meeting-context";
+import { parseSuggestions, SUGGESTION_PREVIEW_WORD_LIMIT } from "../../../lib/suggestion-output";
+import { buildSuggestionPlan, type SuggestionPlan, type SuggestionType } from "../../../lib/suggestion-strategy";
 
 export const runtime = "nodejs";
 
@@ -13,11 +15,6 @@ const MAX_RECENT_CONTEXT_LINES = 24;
 const MAX_RECENT_TRANSCRIPT_CHARS = 5_500;
 const MAX_OLDER_TRANSCRIPT_CHARS = 2_500;
 const OLDER_RELEVANT_LINE_COUNT = 6;
-const SUGGESTION_PREVIEW_WORD_LIMIT = 24;
-const DUPLICATE_SIMILARITY_THRESHOLD = 0.72;
-const VALID_SUGGESTION_TYPES = ["question", "talking", "answer", "fact", "clarifying"] as const;
-
-type SuggestionType = (typeof VALID_SUGGESTION_TYPES)[number];
 
 type TranscriptLine = {
   time?: string;
@@ -52,48 +49,6 @@ type GroqMessage = {
   content: string;
 };
 
-const TYPE_ALIASES: Record<string, SuggestionType> = {
-  answer: "answer",
-  clarification: "clarifying",
-  clarifying: "clarifying",
-  fact: "fact",
-  "fact-check": "fact",
-  factcheck: "fact",
-  question: "question",
-  talking: "talking",
-  "talking-point": "talking",
-};
-
-const SUGGESTION_STOP_WORDS = new Set([
-  "about",
-  "after",
-  "ask",
-  "clarify",
-  "discuss",
-  "for",
-  "from",
-  "next",
-  "question",
-  "should",
-  "summarize",
-  "that",
-  "the",
-  "their",
-  "this",
-  "with",
-]);
-
-const VAGUE_SUGGESTION_PATTERNS = [
-  /^ask for clarification$/,
-  /^ask a clarifying question$/,
-  /^clarify (?:the )?(?:issue|plan|timeline|requirements|next steps|details)$/,
-  /^discuss (?:the )?(?:timeline|plan|next steps|risks|blockers|budget)$/,
-  /^follow up(?: on this)?$/,
-  /^review (?:the )?(?:plan|timeline|next steps)$/,
-  /^summari[sz]e (?:the )?next steps$/,
-  /^talk about (?:the )?(?:plan|timeline|next steps|issue)$/,
-];
-
 function jsonError(message: string, status: number) {
   return Response.json({ error: message }, { status });
 }
@@ -105,30 +60,6 @@ function getGroqError(body: string) {
   } catch {
     return body;
   }
-}
-
-function isSuggestionType(value: unknown): value is SuggestionType {
-  return typeof value === "string" && VALID_SUGGESTION_TYPES.includes(value as SuggestionType);
-}
-
-function normalizeSuggestionType(value: unknown): SuggestionType | null {
-  if (isSuggestionType(value)) {
-    return value;
-  }
-
-  if (typeof value !== "string") {
-    return null;
-  }
-
-  return TYPE_ALIASES[value.trim().toLowerCase().replace(/\s+/g, "-")] ?? null;
-}
-
-function normalizeSuggestionText(value: unknown) {
-  if (typeof value !== "string") {
-    return "";
-  }
-
-  return value.replace(/\s+/g, " ").trim();
 }
 
 function getContextLineCount(value: unknown) {
@@ -147,151 +78,25 @@ function getSuggestionRelevanceQuery(lines: TranscriptLine[]) {
     .join("\n");
 }
 
-function extractJsonObject(content: string) {
-  const trimmed = content.trim();
+function buildUserPayload(context: ReturnType<typeof buildMeetingContext>, plan: SuggestionPlan) {
+  const slotPlan = plan.slots
+    .map(
+      (slot, index) =>
+        `${index + 1}. ${slot.type}${slot.required ? " (required)" : " (preferred)"}: ${slot.reason}`,
+    )
+    .join("\n");
 
-  if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
-    return trimmed;
-  }
-
-  const firstBrace = trimmed.indexOf("{");
-  const lastBrace = trimmed.lastIndexOf("}");
-
-  if (firstBrace === -1 || lastBrace === -1 || lastBrace <= firstBrace) {
-    throw new Error("Suggestion model did not return JSON.");
-  }
-
-  return trimmed.slice(firstBrace, lastBrace + 1);
-}
-
-function suggestionWordCount(text: string) {
-  return text.split(/\s+/).filter(Boolean).length;
-}
-
-function normalizeForComparison(text: string) {
-  return text
-    .toLowerCase()
-    .replace(/[^a-z0-9\s]/g, " ")
-    .split(/\s+/)
-    .filter((word) => word.length > 2 && !SUGGESTION_STOP_WORDS.has(word))
-    .join(" ");
-}
-
-function textSimilarity(first: string, second: string) {
-  const firstWords = new Set(normalizeForComparison(first).split(" ").filter(Boolean));
-  const secondWords = new Set(normalizeForComparison(second).split(" ").filter(Boolean));
-
-  if (firstWords.size === 0 || secondWords.size === 0) {
-    return 0;
-  }
-
-  let sharedWords = 0;
-  firstWords.forEach((word) => {
-    if (secondWords.has(word)) {
-      sharedWords += 1;
-    }
-  });
-
-  return sharedWords / Math.max(firstWords.size, secondWords.size);
-}
-
-function isVagueSuggestion(text: string) {
-  const normalized = text.toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
-  const words = normalized.split(" ").filter(Boolean);
-
-  if (words.length < 3) {
-    return true;
-  }
-
-  return VAGUE_SUGGESTION_PATTERNS.some((pattern) => pattern.test(normalized));
-}
-
-function validateSuggestionQuality(suggestions: Suggestion[]) {
-  const issues: string[] = [];
-
-  suggestions.forEach((suggestion, index) => {
-    if (!suggestion.text) {
-      issues.push(`Suggestion ${index + 1} has empty text.`);
-    }
-
-    if (suggestionWordCount(suggestion.text) > SUGGESTION_PREVIEW_WORD_LIMIT) {
-      issues.push(`Suggestion ${index + 1} is over ${SUGGESTION_PREVIEW_WORD_LIMIT} words.`);
-    }
-
-    if (isVagueSuggestion(suggestion.text)) {
-      issues.push(`Suggestion ${index + 1} is too generic: "${suggestion.text}".`);
-    }
-  });
-
-  if (new Set(suggestions.map((suggestion) => suggestion.type)).size < 2) {
-    issues.push("Use at least two different suggestion types.");
-  }
-
-  for (let firstIndex = 0; firstIndex < suggestions.length; firstIndex += 1) {
-    for (let secondIndex = firstIndex + 1; secondIndex < suggestions.length; secondIndex += 1) {
-      const firstText = normalizeForComparison(suggestions[firstIndex].text);
-      const secondText = normalizeForComparison(suggestions[secondIndex].text);
-
-      if (
-        firstText &&
-        secondText &&
-        (firstText === secondText ||
-          firstText.includes(secondText) ||
-          secondText.includes(firstText) ||
-          textSimilarity(suggestions[firstIndex].text, suggestions[secondIndex].text) >= DUPLICATE_SIMILARITY_THRESHOLD)
-      ) {
-        issues.push(`Suggestions ${firstIndex + 1} and ${secondIndex + 1} are too similar.`);
-      }
-    }
-  }
-
-  return issues;
-}
-
-function parseSuggestions(content: string) {
-  const parsed = JSON.parse(extractJsonObject(content)) as {
-    suggestions?: Array<{
-      type?: unknown;
-      text?: unknown;
-    }>;
-  };
-
-  if (!Array.isArray(parsed.suggestions)) {
-    throw new Error("Suggestion JSON must contain a suggestions array.");
-  }
-
-  const suggestions = parsed.suggestions.map((suggestion, index) => {
-    const type = normalizeSuggestionType(suggestion.type);
-
-    if (!type) {
-      throw new Error(`Suggestion ${index + 1} has an invalid type.`);
-    }
-
-    return {
-      type,
-      text: normalizeSuggestionText(suggestion.text),
-    };
-  });
-
-  if (suggestions.length !== 3) {
-    throw new Error("Suggestion model did not return exactly 3 suggestions.");
-  }
-
-  const qualityIssues = validateSuggestionQuality(suggestions);
-
-  if (qualityIssues.length > 0) {
-    throw new Error(`Suggestion output failed quality checks: ${qualityIssues.join(" ")}`);
-  }
-
-  return suggestions;
-}
-
-function buildUserPayload(context: ReturnType<typeof buildMeetingContext>) {
   return `TASK
 Generate exactly 3 live suggestion previews for the user to see now. Optimize for the next 30-90 seconds of the meeting.
 
 MEETING STATE / CUES
 ${context.cueSummary}
+
+MEETING MODE
+${plan.meetingModeLabel}
+
+SUGGESTION SLOT PLAN
+${slotPlan}
 
 MOST RECENT TRANSCRIPT
 ${context.mostRecentTranscript || "(No recent transcript selected.)"}
@@ -305,8 +110,11 @@ OUTPUT RULES
 - Allowed type values: question, talking, answer, fact, clarifying.
 - Each text must be under ${SUGGESTION_PREVIEW_WORD_LIMIT} words.
 - Make the three cards specific, useful before click, and different in purpose.
+- Each card should help with the user's next turn: ask, say, answer, verify, or clarify.
+- Use the transcript's actual nouns, owners, dates, numbers, and dependencies when possible.
 - Do not use bland placeholders like "Ask for clarification", "Discuss timeline", or "Summarize next steps" unless tied to exact transcript details.
-- Do not invent facts. Use fact only for claims or assumptions that should be verified.`;
+- Do not invent facts. Use fact only for claims or assumptions that should be verified.
+- Follow the slot plan unless doing so would require inventing details.`;
 }
 
 function buildMessages(userPayload: string, systemPrompt: string): GroqMessage[] {
@@ -322,7 +130,15 @@ function buildMessages(userPayload: string, systemPrompt: string): GroqMessage[]
   ];
 }
 
-function buildCorrectionMessages(userPayload: string, systemPrompt: string, rawContent: string, issue: string): GroqMessage[] {
+function buildCorrectionMessages(
+  userPayload: string,
+  systemPrompt: string,
+  rawContent: string,
+  issue: string,
+  plan: SuggestionPlan,
+): GroqMessage[] {
+  const requiredTypes = plan.requiredTypes.length > 0 ? plan.requiredTypes.join(", ") : "none";
+
   return [
     ...buildMessages(userPayload, systemPrompt),
     {
@@ -335,6 +151,9 @@ function buildCorrectionMessages(userPayload: string, systemPrompt: string, rawC
 
 Return a corrected response now. It must be ONLY valid JSON in this exact shape:
 {"suggestions":[{"type":"question","text":"..."},{"type":"talking","text":"..."},{"type":"fact","text":"..."}]}
+
+Required type coverage for this meeting state: ${requiredTypes}
+Plan summary: ${plan.shortSummary}
 
 Keep exactly 3 suggestions, use at least two different types, keep every text under ${SUGGESTION_PREVIEW_WORD_LIMIT} words, and avoid duplicate or generic angles.`,
     },
@@ -351,8 +170,8 @@ async function requestSuggestions(apiKey: string, model: string, messages: GroqM
     body: JSON.stringify({
       model,
       messages,
-      temperature: 0.35,
-      max_tokens: 700,
+      temperature: 0.2,
+      max_tokens: 450,
     }),
   });
 }
@@ -403,6 +222,7 @@ export async function POST(request: Request) {
     maxRecentChars: MAX_RECENT_TRANSCRIPT_CHARS,
     maxOlderChars: MAX_OLDER_TRANSCRIPT_CHARS,
   });
+  const suggestionPlan = buildSuggestionPlan(meetingContext.cues);
   const transcriptContextLength =
     meetingContext.mostRecentTranscript.length + meetingContext.olderRelevantTranscript.length;
 
@@ -426,9 +246,13 @@ export async function POST(request: Request) {
     transcriptContextLength,
     contextWindowLines: contextLineCount,
     promptLength: systemPrompt.length,
+    meetingMode: suggestionPlan.meetingMode,
+    meetingModeLabel: suggestionPlan.meetingModeLabel,
+    requiredTypes: suggestionPlan.requiredTypes,
+    planSummary: suggestionPlan.shortSummary,
   });
 
-  const userPayload = buildUserPayload(meetingContext);
+  const userPayload = buildUserPayload(meetingContext, suggestionPlan);
   let groqResult = await requestSuggestions(apiKey, requestedModel, buildMessages(userPayload, systemPrompt));
   let groqResponse = groqResult.response;
   let responseBody = groqResult.body;
@@ -473,7 +297,7 @@ export async function POST(request: Request) {
 
   try {
     rawContent = getCompletionContent(responseBody);
-    suggestions = parseSuggestions(rawContent);
+    suggestions = parseSuggestions(rawContent, suggestionPlan);
   } catch (error) {
     const message = error instanceof Error ? error.message : "Could not parse suggestions.";
     const correctionStartedAt = new Date();
@@ -490,7 +314,7 @@ export async function POST(request: Request) {
     groqResult = await requestSuggestions(
       apiKey,
       requestedModel,
-      buildCorrectionMessages(userPayload, systemPrompt, rawContent, message),
+      buildCorrectionMessages(userPayload, systemPrompt, rawContent, message, suggestionPlan),
     );
     groqResponse = groqResult.response;
     responseBody = groqResult.body;
@@ -532,7 +356,7 @@ export async function POST(request: Request) {
 
     try {
       rawContent = getCompletionContent(responseBody);
-      suggestions = parseSuggestions(rawContent);
+      suggestions = parseSuggestions(rawContent, suggestionPlan);
     } catch (correctionError) {
       const completedAt = new Date();
       const durationMs = completedAt.getTime() - requestedAt.getTime();
@@ -587,8 +411,18 @@ export async function POST(request: Request) {
     correctionUsed,
     retryCount: transportRetryCount,
     retryDelayMs: transportRetryDelayMs,
+    meetingMode: suggestionPlan.meetingMode,
+    meetingModeLabel: suggestionPlan.meetingModeLabel,
+    requiredTypes: suggestionPlan.requiredTypes,
+    planSummary: suggestionPlan.shortSummary,
     suggestions,
   });
 
-  return Response.json({ suggestions });
+  return Response.json({
+    suggestions,
+    rationale: suggestionPlan.shortSummary,
+    meetingMode: suggestionPlan.meetingMode,
+    meetingModeLabel: suggestionPlan.meetingModeLabel,
+    selectionPlan: suggestionPlan.slots,
+  });
 }

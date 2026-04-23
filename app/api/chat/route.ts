@@ -13,8 +13,8 @@ const MAX_RECENT_CONTEXT_LINES = 80;
 const MAX_RECENT_TRANSCRIPT_CHARS = 8_000;
 const MAX_OLDER_TRANSCRIPT_CHARS = 3_500;
 const OLDER_RELEVANT_LINE_COUNT = 8;
-const MAX_CHAT_HISTORY_CHARS = 5_000;
-const CHAT_MAX_OUTPUT_TOKENS = 1_800;
+const MAX_CHAT_HISTORY_CHARS = 4_000;
+const CHAT_MAX_OUTPUT_TOKENS = 1_400;
 const MAX_ANSWER_CHARS = 7_000;
 
 type TranscriptLine = {
@@ -114,30 +114,34 @@ function getClickedSuggestionInstructions(suggestionType: string) {
     case "question":
       return [
         "- Treat the clicked card as a question the user may ask.",
-        "- Give a polished version of the question first.",
-        "- Explain why it matters now, then include one optional follow-up if useful.",
+        '- Format it as: "Say this", "Why now", and optional "Follow-up".',
+        "- In 'Say this', give one polished sentence the user can say verbatim.",
+        "- Keep 'Why now' to one short reason tied to the live discussion.",
       ].join("\n");
     case "talking":
       return [
         "- Treat the clicked card as a point the user may say next.",
-        "- Give 2-4 concrete, meeting-ready points.",
-        "- Keep the language natural enough to say aloud.",
+        '- Format it as: "Say this next" followed by 2-3 concise bullets.',
+        "- Make each bullet sound natural enough to speak aloud.",
+        "- Prefer crisp spoken phrasing over explanation.",
       ].join("\n");
     case "answer":
       return [
         "- Treat the clicked card as a likely answer to a recent question.",
-        "- Give the likely answer first.",
-        "- Then list assumptions and transcript evidence.",
+        '- Format it as: "Most likely answer", "Why that answer fits", and "Assumptions / gaps".',
+        "- Start with the most likely answer in one line.",
+        "- Then separate transcript support from assumptions.",
       ].join("\n");
     case "fact":
       return [
         "- Treat the clicked card as a verification item.",
-        "- Split the response into Supported by transcript and Needs verification.",
-        "- Explain briefly why the claim matters.",
+        '- Format it as: "Supported by transcript", "Needs verification", and "Why it matters".',
+        "- Keep each section short and concrete.",
       ].join("\n");
     case "clarifying":
       return [
         "- Treat the clicked card as a clarification request.",
+        '- Format it as: "Plain-English explanation", "How it applies here", and optional "What to say next".',
         "- Explain the concept or distinction simply.",
         "- Tie it back to the meeting context and why it matters now.",
       ].join("\n");
@@ -149,10 +153,11 @@ function getClickedSuggestionInstructions(suggestionType: string) {
 function getResponseInstructions(suggestionType?: string) {
   if (suggestionType) {
     return `Clicked suggestion response:
-- Start with the most useful direct answer or next move in 1-2 sentences.
+- Start with the most useful direct answer or next move.
+- Keep the structure tight and meeting-ready, not essay-like.
 - Cite supporting transcript moments by timestamp when possible.
 - Clearly separate what is supported by transcript from what is inferred or missing.
-- End with a short "what to say next" or best follow-up question when useful.
+- Keep the answer concise enough to scan during a live conversation.
 ${getClickedSuggestionInstructions(suggestionType)}`;
   }
 
