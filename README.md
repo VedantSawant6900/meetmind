@@ -108,21 +108,21 @@ http://localhost:3000
 
 ## Settings
 
-The top-right **Settings** modal controls the runtime model parameters:
+The top-right **Settings** modal always shows the Groq API key. Runtime model and prompt controls are restricted to admin mode:
 
 | Setting | Default | Purpose |
 | --- | --- | --- |
 | Groq API key | empty | Used by API routes to call Groq. |
-| Whisper model | `whisper-large-v3` | Audio transcription model. |
-| Transcript language | `en` | Sent to Whisper to prefer English transcription. |
-| Suggestion model | `openai/gpt-oss-120b` | Used for live suggestions and chat answers. |
-| Chunk interval | `30` seconds | How often audio is chunked, transcribed, and used for refresh timing. |
-| Developer mode | `1234` demo password | Unlocks prompt and context-window editing. |
-| Live suggestion context window | `18` lines | Developer-mode control for each suggestion batch. |
-| Expanded answer context window | `80` lines | Developer-mode control for clicked suggestions and typed chat. |
-| Live suggestion prompt | built-in default | Developer-mode control for three short suggestion previews. |
-| Detailed answer prompt | built-in default | Developer-mode control for expanded clicked-suggestion answers. |
-| Chat prompt | built-in default | Developer-mode control for direct typed questions. |
+| Admin mode | `1234` demo password | Unlocks runtime model, prompt, and context-window editing. |
+| Whisper model | `whisper-large-v3` | Admin-mode control for the audio transcription model. |
+| Transcript language | `en` | Admin-mode control sent to Whisper to prefer English transcription. |
+| Suggestion model | `openai/gpt-oss-120b` | Admin-mode control used for live suggestions and chat answers. |
+| Chunk interval | `30` seconds | Admin-mode control for how often audio is chunked, transcribed, and used for refresh timing. |
+| Live suggestion context window | `18` lines | Admin-mode control for each suggestion batch. |
+| Expanded answer context window | `80` lines | Admin-mode control for clicked suggestions and typed chat. |
+| Live suggestion prompt | built-in default | Admin-mode control for three short suggestion previews. |
+| Detailed answer prompt | built-in default | Admin-mode control for expanded clicked-suggestion answers. |
+| Chat prompt | built-in default | Admin-mode control for direct typed questions. |
 
 Settings are stored in browser session storage, not committed to the repository.
 
@@ -136,7 +136,7 @@ Create `.env.local` if you want a local fallback key:
 GROQ_API_KEY=your_groq_key_here
 ```
 
-Developer mode checks the password on the server. The committed demo fallback unlocks with `1234`; for any real deployment, override it with a SHA-256 password hash:
+Admin mode checks the password on the server. The committed demo fallback unlocks with `1234`; for any real deployment, override it with a SHA-256 password hash:
 
 ```bash
 DEVELOPER_MODE_PASSWORD_HASH=your_sha256_hex_hash_here

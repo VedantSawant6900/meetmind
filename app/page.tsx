@@ -1458,12 +1458,11 @@ export default function Home() {
   const handleResetDefaults = useCallback(() => {
     const resetDeveloperSettings = developerModeUnlockedRef.current;
 
-    setWhisperModel(DEFAULT_WHISPER_MODEL);
-    setTranscriptionLanguage(DEFAULT_TRANSCRIPTION_LANGUAGE);
-    setSuggestionModel(DEFAULT_SUGGESTION_MODEL);
-    setChunkIntervalSeconds(DEFAULT_CHUNK_INTERVAL_SECONDS);
-
     if (resetDeveloperSettings) {
+      setWhisperModel(DEFAULT_WHISPER_MODEL);
+      setTranscriptionLanguage(DEFAULT_TRANSCRIPTION_LANGUAGE);
+      setSuggestionModel(DEFAULT_SUGGESTION_MODEL);
+      setChunkIntervalSeconds(DEFAULT_CHUNK_INTERVAL_SECONDS);
       setSuggestionContextLines(DEFAULT_SUGGESTION_CONTEXT_LINES);
       setDetailContextLines(DEFAULT_DETAIL_CONTEXT_LINES);
       setLiveSuggestionPrompt(DEFAULT_LIVE_SUGGESTION_PROMPT);
@@ -1805,53 +1804,10 @@ export default function Home() {
                 />
               </label>
 
-              <label className="settings-field" htmlFor="whisperModel">
-                <span>Whisper model</span>
-                <input
-                  id="whisperModel"
-                  onChange={(event) => setWhisperModel(event.target.value)}
-                  value={whisperModel}
-                />
-              </label>
-
-              <label className="settings-field" htmlFor="transcriptionLanguage">
-                <span>Transcript language</span>
-                <input
-                  id="transcriptionLanguage"
-                  onChange={(event) => setTranscriptionLanguage(event.target.value)}
-                  value={transcriptionLanguage}
-                />
-              </label>
-
-              <label className="settings-field" htmlFor="suggestionModel">
-                <span>Suggestion model</span>
-                <input
-                  id="suggestionModel"
-                  onChange={(event) => setSuggestionModel(event.target.value)}
-                  value={suggestionModel}
-                />
-              </label>
-
-              <label className="settings-field" htmlFor="chunkIntervalSeconds">
-                <span>Chunk interval</span>
-                <div className="number-input-wrap">
-                  <input
-                    id="chunkIntervalSeconds"
-                    max={MAX_CHUNK_INTERVAL_SECONDS}
-                    min={MIN_CHUNK_INTERVAL_SECONDS}
-                    onChange={(event) => handleChunkIntervalChange(event.target.value)}
-                    step={1}
-                    type="number"
-                    value={chunkIntervalSeconds}
-                  />
-                  <span>seconds</span>
-                </div>
-              </label>
-
               <div className="developer-mode-panel settings-field-wide">
                 {developerModeUnlocked ? (
                   <div className="developer-mode-status">
-                    <span>Developer mode unlocked</span>
+                    <span>Admin mode unlocked</span>
                     <button
                       className="settings-secondary"
                       disabled={developerModeLoading}
@@ -1864,7 +1820,7 @@ export default function Home() {
                 ) : (
                   <form className="developer-mode-form" onSubmit={handleDeveloperModeUnlock}>
                     <label className="settings-field" htmlFor="developerModePassword">
-                      <span>Developer mode</span>
+                      <span>Admin mode</span>
                       <div className="developer-mode-unlock-row">
                         <input
                           autoComplete="off"
@@ -1886,6 +1842,49 @@ export default function Home() {
 
               {developerModeUnlocked ? (
                 <>
+                  <label className="settings-field" htmlFor="whisperModel">
+                    <span>Whisper model</span>
+                    <input
+                      id="whisperModel"
+                      onChange={(event) => setWhisperModel(event.target.value)}
+                      value={whisperModel}
+                    />
+                  </label>
+
+                  <label className="settings-field" htmlFor="transcriptionLanguage">
+                    <span>Transcript language</span>
+                    <input
+                      id="transcriptionLanguage"
+                      onChange={(event) => setTranscriptionLanguage(event.target.value)}
+                      value={transcriptionLanguage}
+                    />
+                  </label>
+
+                  <label className="settings-field" htmlFor="suggestionModel">
+                    <span>Suggestion model</span>
+                    <input
+                      id="suggestionModel"
+                      onChange={(event) => setSuggestionModel(event.target.value)}
+                      value={suggestionModel}
+                    />
+                  </label>
+
+                  <label className="settings-field" htmlFor="chunkIntervalSeconds">
+                    <span>Chunk interval</span>
+                    <div className="number-input-wrap">
+                      <input
+                        id="chunkIntervalSeconds"
+                        max={MAX_CHUNK_INTERVAL_SECONDS}
+                        min={MIN_CHUNK_INTERVAL_SECONDS}
+                        onChange={(event) => handleChunkIntervalChange(event.target.value)}
+                        step={1}
+                        type="number"
+                        value={chunkIntervalSeconds}
+                      />
+                      <span>seconds</span>
+                    </div>
+                  </label>
+
                   <label className="settings-field" htmlFor="suggestionContextLines">
                     <span>Live suggestion context window</span>
                     <div className="number-input-wrap">
@@ -1952,9 +1951,11 @@ export default function Home() {
             </div>
 
             <div className="settings-footer">
-              <button className="settings-secondary" onClick={handleResetDefaults} type="button">
-                Reset defaults
-              </button>
+              {developerModeUnlocked ? (
+                <button className="settings-secondary" onClick={handleResetDefaults} type="button">
+                  Reset defaults
+                </button>
+              ) : null}
               <button className="settings-primary" onClick={handleCloseSettings} type="button">
                 Done
               </button>
