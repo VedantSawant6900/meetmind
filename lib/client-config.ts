@@ -1,10 +1,12 @@
 import type { StoredSettings } from "./client-types";
 
 export const SETTINGS_STORAGE_KEY = "meetmind.settings";
+export const SETTINGS_SCHEMA_VERSION = 2;
 export const LEGACY_GROQ_KEY_STORAGE_KEY = "meetmind.groqApiKey";
 
 export const DEFAULT_WHISPER_MODEL = "whisper-large-v3";
-export const DEFAULT_TRANSCRIPTION_LANGUAGE = "en";
+export const DEFAULT_TRANSCRIPTION_LANGUAGE = "";
+export const AUTO_TRANSCRIPTION_LANGUAGE_LABEL = "auto-detect";
 export const DEFAULT_SUGGESTION_MODEL = "openai/gpt-oss-120b";
 export const DEFAULT_CHUNK_INTERVAL_SECONDS = 30;
 export const MIN_CHUNK_INTERVAL_SECONDS = 5;

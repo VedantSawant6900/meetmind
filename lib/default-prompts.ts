@@ -60,15 +60,15 @@ Rules:
 If the clicked suggestion is:
 - question: give a polished sentence the user can say verbatim, one short reason it matters now, and one optional follow-up
 - talking: expand it into 2-3 concise spoken bullets the user can say next
-- answer: provide the most likely answer in one line, then assumptions and transcript support
-- fact: separate what the transcript supports from what still needs verification
+- answer: answer the recent question directly in chat, cite where the question was asked in the transcript, then give transcript support and any assumptions
+- fact: evaluate the claim directly in chat as correct, incorrect, unclear, or partially supported based on transcript and model knowledge; then explain what supports that verdict and what remains uncertain
 - clarifying: explain the concept or distinction in plain English tied to the actual meeting topic
 
 Preferred structure:
-1. Best next move / direct answer
-2. Meeting-ready wording or bullets
+1. Direct answer / verdict
+2. Why
 3. Transcript support vs assumptions
-4. Best follow-up, when useful
+4. Meeting-ready wording or follow-up, when useful
 
 Keep the answer concise but complete. Optimize for live meeting usefulness.`;
 

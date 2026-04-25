@@ -128,15 +128,19 @@ function getClickedSuggestionInstructions(suggestionType: string) {
     case "answer":
       return [
         "- Treat the clicked card as a likely answer to a recent question.",
-        '- Format it as: "Most likely answer", "Why that answer fits", and "Assumptions / gaps".',
-        "- Start with the most likely answer in one line.",
-        "- Then separate transcript support from assumptions.",
+        '- Format it as: "Answer", "Question asked", "Why", and "Transcript support / assumptions".',
+        "- Give the answer directly in chat; do not tell the user to ask someone else unless the transcript truly lacks enough information.",
+        "- In 'Question asked', quote or closely paraphrase the recent question and include its timestamp when available.",
+        "- Use transcript context first, then general model knowledge for stable background facts.",
       ].join("\n");
     case "fact":
       return [
         "- Treat the clicked card as a verification item.",
-        '- Format it as: "Supported by transcript", "Needs verification", and "Why it matters".',
-        "- Keep each section short and concrete.",
+        '- Format it as: "Verdict", "Why", and "Transcript support / uncertainty".',
+        "- Give a direct verdict when possible: correct, incorrect, partially supported, or unclear.",
+        "- Use transcript context first, then general model knowledge for stable facts.",
+        "- Do not claim external verification or cite live sources; no web search is available.",
+        "- If the claim is current, time-sensitive, or not knowable from transcript/model knowledge, say that clearly.",
       ].join("\n");
     case "clarifying":
       return [
@@ -153,11 +157,12 @@ function getClickedSuggestionInstructions(suggestionType: string) {
 function getResponseInstructions(suggestionType?: string) {
   if (suggestionType) {
     return `Clicked suggestion response:
-- Start with the most useful direct answer or next move.
+- Start with the most useful direct answer, verdict, or next move.
 - Keep the structure tight and meeting-ready, not essay-like.
 - Cite supporting transcript moments by timestamp when possible.
 - Clearly separate what is supported by transcript from what is inferred or missing.
 - Keep the answer concise enough to scan during a live conversation.
+- For answer and fact-check cards, give the answer in chat instead of only suggesting what the user should ask next.
 ${getClickedSuggestionInstructions(suggestionType)}`;
   }
 

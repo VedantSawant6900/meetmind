@@ -1,7 +1,7 @@
 "use client";
 
 import type { RefObject } from "react";
-import { DEFAULT_TRANSCRIPTION_LANGUAGE } from "../lib/client-config";
+import { AUTO_TRANSCRIPTION_LANGUAGE_LABEL } from "../lib/client-config";
 import type { TranscriptLine } from "../lib/client-types";
 
 type TranscriptPanelProps = {
@@ -54,7 +54,7 @@ export function TranscriptPanel({
         <div className="help-banner">
           The transcript scrolls and appends new chunks every ~{chunkIntervalSeconds} seconds while recording. Audio
           is captured from the mic and transcribed with Groq Whisper Large V3 using language{" "}
-          {transcriptionLanguage || DEFAULT_TRANSCRIPTION_LANGUAGE}.
+          {transcriptionLanguage || AUTO_TRANSCRIPTION_LANGUAGE_LABEL}.
         </div>
         {transcriptLines.length === 0 ? (
           <div className="empty" id="transcriptEmpty">

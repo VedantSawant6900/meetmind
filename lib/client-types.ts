@@ -62,6 +62,7 @@ export type TranscriptFilterContext = {
 };
 
 export type StoredSettings = {
+  settingsVersion?: number;
   groqApiKey?: string;
   whisperModel?: string;
   transcriptionLanguage?: string;

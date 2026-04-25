@@ -4,7 +4,6 @@ export const runtime = "nodejs";
 
 const GROQ_TRANSCRIPTION_URL = "https://api.groq.com/openai/v1/audio/transcriptions";
 const DEFAULT_TRANSCRIPTION_MODEL = "whisper-large-v3";
-const DEFAULT_TRANSCRIPTION_LANGUAGE = "en";
 
 type GroqTranscriptionResponse = {
   text?: string;
@@ -60,7 +59,7 @@ function getGroqError(body: string) {
 
 function getRequestedLanguage(value: FormDataEntryValue | null) {
   if (typeof value !== "string" || !value.trim()) {
-    return DEFAULT_TRANSCRIPTION_LANGUAGE;
+    return null;
   }
 
   return value.trim();
@@ -140,7 +139,9 @@ export async function POST(request: Request) {
   const groqForm = new FormData();
   groqForm.append("file", audio, audio.name || "meeting-chunk.webm");
   groqForm.append("model", requestedModel);
-  groqForm.append("language", requestedLanguage);
+  if (requestedLanguage) {
+    groqForm.append("language", requestedLanguage);
+  }
   groqForm.append("response_format", "verbose_json");
   groqForm.append("temperature", "0");
 

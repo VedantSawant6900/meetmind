@@ -63,11 +63,11 @@ export function SettingsModal({
   onChatPromptChange,
   onResetDefaults,
 }: SettingsModalProps) {
-  if (!open) {
-    return null;
-  }
-
   useEffect(() => {
+    if (!open) {
+      return;
+    }
+
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         onClose();
@@ -76,7 +76,11 @@ export function SettingsModal({
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [onClose]);
+  }, [onClose, open]);
+
+  if (!open) {
+    return null;
+  }
 
   return (
     <div

@@ -29,6 +29,8 @@ import {
   DEFAULT_WHISPER_MODEL,
   LEGACY_GROQ_KEY_STORAGE_KEY,
   SETTINGS_STORAGE_KEY,
+  SETTINGS_SCHEMA_VERSION,
+  AUTO_TRANSCRIPTION_LANGUAGE_LABEL,
   clampChunkInterval,
   clampContextLines,
   getDetailServerTranscriptLineLimit,
@@ -386,12 +388,10 @@ export default function Home() {
         startedAt: startedAt.toISOString(),
         endedAt: endedAt.toISOString(),
       };
+      const nextLines = [...currentLines, line];
 
-      setTranscriptLines((current) => {
-        const nextLines = [...current, line];
-        transcriptLinesRef.current = nextLines;
-        return nextLines;
-      });
+      transcriptLinesRef.current = nextLines;
+      setTranscriptLines(nextLines);
 
       emitClientLog("transcription", "transcript_text_appended", {
         id,
@@ -423,16 +423,18 @@ export default function Home() {
         const mimeType = blob.type || "audio/webm";
         const fileName = `meeting-${startedAt.getTime()}.${extensionForMimeType(mimeType)}`;
         const model = whisperModelRef.current || DEFAULT_WHISPER_MODEL;
-        const language = transcriptionLanguageRef.current || DEFAULT_TRANSCRIPTION_LANGUAGE;
+        const language = transcriptionLanguageRef.current.trim();
 
         formData.append("audio", blob, fileName);
         formData.append("model", model);
-        formData.append("language", language);
+        if (language) {
+          formData.append("language", language);
+        }
 
         emitClientLog("transcription", "transcription_request_started", {
           fileName,
           model,
-          language,
+          language: language || AUTO_TRANSCRIPTION_LANGUAGE_LABEL,
           audioType: mimeType,
           audioSize: blob.size,
           startedAt: startedAt.toISOString(),
@@ -580,6 +582,14 @@ export default function Home() {
           manualSegmentFlushResolverRef.current = null;
         }
 
+        if (!shouldContinueRecordingRef.current && transcriptionTask) {
+          void transcriptionTask.then(() => {
+            if (!suggestionsLoadingRef.current && transcriptLinesRef.current.length > 0) {
+              void generateSuggestionBatch("auto");
+            }
+          });
+        }
+
         if (
           shouldContinueRecordingRef.current &&
           mediaStreamRef.current === stream &&
@@ -603,6 +613,7 @@ export default function Home() {
     [
       clearSegmentTimer,
       enqueueTranscription,
+      generateSuggestionBatch,
       hasSegmentSpeechActivity,
       resetSegmentAudioActivity,
       stopAudioActivityMonitor,
@@ -1186,6 +1197,7 @@ export default function Home() {
   useEffect(() => {
     const storedSettings = parseStoredSettings(window.sessionStorage.getItem(SETTINGS_STORAGE_KEY));
     const storedLegacyKey = window.sessionStorage.getItem(LEGACY_GROQ_KEY_STORAGE_KEY);
+    const promptSettingsAreCurrent = storedSettings?.settingsVersion === SETTINGS_SCHEMA_VERSION;
 
     if (storedSettings?.groqApiKey || storedLegacyKey) {
       setGroqApiKey(storedSettings?.groqApiKey ?? storedLegacyKey ?? "");
@@ -1217,15 +1229,15 @@ export default function Home() {
       setDetailContextLines(clampContextLines(storedSettings.detailContextLines, DEFAULT_DETAIL_CONTEXT_LINES));
     }
 
-    if (storedSettings?.liveSuggestionPrompt) {
+    if (promptSettingsAreCurrent && storedSettings?.liveSuggestionPrompt) {
       setLiveSuggestionPrompt(storedSettings.liveSuggestionPrompt);
     }
 
-    if (storedSettings?.detailAnswerPrompt) {
+    if (promptSettingsAreCurrent && storedSettings?.detailAnswerPrompt) {
       setDetailAnswerPrompt(storedSettings.detailAnswerPrompt);
     }
 
-    if (storedSettings?.chatPrompt) {
+    if (promptSettingsAreCurrent && storedSettings?.chatPrompt) {
       setChatPrompt(storedSettings.chatPrompt);
     }
 
@@ -1237,6 +1249,7 @@ export default function Home() {
 
   useEffect(() => {
     const settings: StoredSettings = {
+      settingsVersion: SETTINGS_SCHEMA_VERSION,
       groqApiKey,
       whisperModel,
       transcriptionLanguage,
@@ -1278,7 +1291,7 @@ export default function Home() {
   }, [whisperModel]);
 
   useEffect(() => {
-    transcriptionLanguageRef.current = transcriptionLanguage.trim() || DEFAULT_TRANSCRIPTION_LANGUAGE;
+    transcriptionLanguageRef.current = transcriptionLanguage.trim();
   }, [transcriptionLanguage]);
 
   useEffect(() => {
